@@ -10,6 +10,10 @@ Configuration comes from the environment (see .env.example):
 - PAGEINDEX_API_TOKEN: when set, every endpoint but /health requires
   ``Authorization: Bearer <token>``.
 - PAGEINDEX_MAX_UPLOAD_MB: upload size limit (default 50).
+- PAGEINDEX_INDEX_WORKERS: documents indexed in parallel (default 1).
+
+Uploads are queued as jobs under ``<storage>/jobs`` and indexed in the
+background (see server/jobs.py); poll ``GET /jobs/{job_id}`` for the result.
 
 Run with ``uvicorn server.app:app``.
 """
@@ -22,18 +26,23 @@ import re
 import shutil
 import tempfile
 import threading
-from typing import Any, Callable, Mapping, Optional, Union
+from contextlib import asynccontextmanager
+from typing import Any, Callable, Literal, Mapping, Optional, Union
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import (Depends, FastAPI, File, HTTPException, Query, Request,
+                     Response, UploadFile)
 from pydantic import BaseModel, Field
 
 from pageindex import PageIndexAPIError
 from pageindex.utils import LLMRetriesExhausted
+from server.jobs import JobRunner, JobStore
 
 logger = logging.getLogger("pageindex.server")
 
 DEFAULT_STORAGE_PATH = "/app/storage"
 DEFAULT_MAX_UPLOAD_MB = 50
+DEFAULT_INDEX_WORKERS = 1
+_MAX_JOB_ERROR = 300
 _CHUNK = 1024 * 1024
 # Exceptions raised by these packages come from the model provider round trip.
 _UPSTREAM_MODULES = {"litellm", "openai", "httpx", "httpcore"}
@@ -89,6 +98,20 @@ def _max_upload_bytes(env: Mapping[str, str]) -> int:
     return int(mb * 1024 * 1024)
 
 
+def _index_workers(env: Mapping[str, str]) -> int:
+    raw = _set(env, "PAGEINDEX_INDEX_WORKERS")
+    if raw is None:
+        return DEFAULT_INDEX_WORKERS
+    try:
+        workers = int(raw)
+    except ValueError:
+        workers = 0
+    if workers < 1:
+        raise ValueError(
+            f"PAGEINDEX_INDEX_WORKERS must be an integer >= 1, got {raw!r}")
+    return workers
+
+
 # ---------- error mapping ----------
 
 def _is_upstream(exc: BaseException) -> bool:
@@ -124,6 +147,19 @@ def _http_error(exc: Exception) -> HTTPException:
     raise exc
 
 
+def _job_error(exc: Exception) -> str:
+    """Error text stored on a failed job, under the same no-leak policy as
+    ``_http_error``; anything unclassified is reported by class name only."""
+    try:
+        message = str(_http_error(exc).detail)
+    except Exception:
+        logger.exception("Indexing failed")
+        message = f"Indexing failed ({type(exc).__name__})."
+    if len(message) > _MAX_JOB_ERROR:
+        message = message[:_MAX_JOB_ERROR - 3] + "..."
+    return message
+
+
 # ---------- request models ----------
 
 class ChatRequest(BaseModel):
@@ -152,12 +188,11 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
     env = dict(os.environ if env is None else env)
     token = _set(env, "PAGEINDEX_API_TOKEN")
     max_upload = _max_upload_bytes(env)
+    workers = _index_workers(env)
+    storage = _set(env, "PAGEINDEX_STORAGE_PATH") or DEFAULT_STORAGE_PATH
 
     state = {"client": client}
     client_lock = threading.Lock()
-    # Indexing runs many concurrent model calls per document; one document at
-    # a time keeps provider load bounded. The store itself locks its writes.
-    index_lock = threading.Lock()
 
     def get_client():
         if state["client"] is None:
@@ -176,7 +211,20 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
             raise HTTPException(401, "Invalid or missing bearer token.",
                                 headers={"WWW-Authenticate": "Bearer"})
 
-    app = FastAPI(title="PageIndex API", version="1.0")
+    # Indexing runs many concurrent model calls per document; the worker
+    # count (default 1) bounds provider load. The SDK store locks its writes.
+    jobs = JobStore(os.path.join(storage, "jobs"))
+    runner = JobRunner(jobs, get_client, _job_error, workers=workers)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        runner.start()
+        try:
+            yield
+        finally:
+            runner.stop()
+
+    app = FastAPI(title="PageIndex API", version="1.0", lifespan=lifespan)
     protected = [Depends(require_token)]
 
     @app.get("/health")
@@ -186,10 +234,12 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
             "index_model": _set(env, "PAGEINDEX_INDEX_MODEL"),
             "chat_model": _set(env, "PAGEINDEX_CHAT_MODEL"),
             "auth": token is not None,
+            "queue": jobs.counts(),
         }
 
-    @app.post("/documents", status_code=201, dependencies=protected)
-    def upload_document(file: UploadFile = File(...)) -> dict[str, Any]:
+    @app.post("/documents", status_code=202, dependencies=protected)
+    def upload_document(response: Response,
+                        file: UploadFile = File(...)) -> dict[str, Any]:
         name = _safe_pdf_name(file.filename)
         workdir = tempfile.mkdtemp(prefix="pageindex-upload-")
         try:
@@ -205,16 +255,40 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
             with open(path, "rb") as check:
                 if not check.read(5).startswith(b"%PDF-"):
                     raise HTTPException(400, "File is not a PDF.")
-            try:
-                with index_lock:
-                    result = get_client().submit_document(path)
-            except HTTPException:
-                raise
-            except Exception as exc:
-                raise _http_error(exc) from exc
-            return {"doc_id": result["doc_id"], "name": result.get("name")}
+            job = jobs.create(name, path)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+        runner.enqueue(job["id"])
+        response.headers["Location"] = f"/jobs/{job['id']}"
+        return {"job_id": job["id"], "status": job["status"], "name": name}
+
+    @app.get("/jobs", dependencies=protected)
+    def list_jobs(status: Optional[Literal["queued", "processing", "done", "failed"]] = None,
+                  limit: int = Query(50, ge=1, le=10000),
+                  offset: int = Query(0, ge=0)) -> dict[str, Any]:
+        found = [job for job in jobs.list() if status is None or job["status"] == status]
+        return {"jobs": found[offset:offset + limit], "total": len(found),
+                "limit": limit, "offset": offset}
+
+    def _job_or_404(job_id: str) -> dict[str, Any]:
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(404, "Job not found.")
+        return job
+
+    @app.get("/jobs/{job_id}", dependencies=protected)
+    def get_job(job_id: str) -> dict[str, Any]:
+        return _job_or_404(job_id)
+
+    @app.post("/jobs/{job_id}/retry", status_code=202, dependencies=protected)
+    def retry_job(job_id: str, response: Response) -> dict[str, Any]:
+        _job_or_404(job_id)
+        job = jobs.update(job_id, expect=("failed",), status="queued", error=None)
+        if job is None:
+            raise HTTPException(409, "Only failed jobs can be retried.")
+        runner.enqueue(job_id)
+        response.headers["Location"] = f"/jobs/{job_id}"
+        return job
 
     @app.get("/documents", dependencies=protected)
     def list_documents(limit: int = Query(50, ge=1, le=10000),
