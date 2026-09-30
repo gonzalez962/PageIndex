@@ -34,7 +34,8 @@ when no token is configured. `/health` never needs it.
 
 | Action | Request |
 |--------|---------|
-| Index a PDF | `curl -s -H "Authorization: Bearer $TOKEN" -F file=@report.pdf http://127.0.0.1:8000/documents` |
+| Index a PDF | see [Index a PDF](#index-a-pdf) |
+| List jobs | `curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/jobs?status=failed"` |
 | List documents | `curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/documents?limit=50&offset=0"` |
 | Get one | `curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/documents/<doc_id>` |
 | Delete one | `curl -s -X DELETE -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/documents/<doc_id>` |
@@ -48,15 +49,47 @@ curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
 ```
 
 `doc_id` accepts one id, a list of ids, or `null` (the whole library).
-Indexing is synchronous: `POST /documents` returns once the document is
-indexed, which can take minutes for large PDFs. Interactive docs are served
-at `http://127.0.0.1:8000/docs`.
+Interactive docs are served at `http://127.0.0.1:8000/docs`.
+
+### Index a PDF
+
+Uploads are queued: `POST /documents` checks the file and answers `202` right
+away; indexing runs in the background. Poll the job until it is `done`, then
+use its `doc_id`.
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" -F file=@report.pdf \
+  http://127.0.0.1:8000/documents
+# {"job_id":"job-3f2a...","status":"queued","name":"report.pdf"}
+
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/jobs/job-3f2a...
+# {"id":"job-3f2a...","status":"done","doc_id":"pi-...","attempts":1,...}
+```
+
+| Job status | Meaning |
+|------------|---------|
+| `queued` | Waiting for a worker |
+| `processing` | Being indexed (minutes for large PDFs) |
+| `done` | Indexed; `doc_id` is set |
+| `failed` | `error` says why; the PDF is kept for a retry |
+
+Retry a failed job after fixing the cause (e.g. the provider key):
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8000/jobs/job-3f2a.../retry
+```
+
+`GET /jobs` lists jobs newest first (`status`, `limit`, `offset` filters), and
+`/health` reports `"queue": {"queued": n, "processing": n}`.
 
 | Status | Meaning |
 |--------|---------|
-| 400 | The SDK rejected the input (e.g. a blank PDF) |
+| 202 | Upload or retry accepted; follow the `Location` header to the job |
+| 400 | Not a PDF, or the SDK rejected the input |
 | 401 | Missing or wrong bearer token |
-| 404 | Unknown document |
+| 404 | Unknown document or job |
+| 409 | Retry of a job that is not `failed` |
 | 413 | Upload over `PAGEINDEX_MAX_UPLOAD_MB` |
 | 415 | Not a `.pdf` file |
 | 502 | The model provider failed (model name, base URL, or key) |
@@ -75,6 +108,7 @@ All settings live in `.env`; see `.env.example` for the annotated list.
 | `PAGEINDEX_API_TOKEN` | unset (no auth) | Bearer token for every endpoint but `/health` |
 | `PAGEINDEX_PORT` | `8000` | Host port, bound on `127.0.0.1` only |
 | `PAGEINDEX_MAX_UPLOAD_MB` | `50` | Upload size limit |
+| `PAGEINDEX_INDEX_WORKERS` | `1` | Documents indexed in parallel |
 
 Restart after editing `.env`: `docker compose up -d api`.
 
@@ -84,8 +118,23 @@ Indexed documents live in the named volume `storage` (`/app/storage` in the
 container). They survive `docker compose down`, restarts, and rebuilds;
 `docker compose down -v` deletes them.
 
-The API runs one uvicorn worker and indexes one document at a time; chat
-requests run concurrently.
+### Indexing queue
+
+Each upload is stored as a job in `/app/storage/jobs/<job_id>/` (`job.json`
+plus the PDF), so the queue lives in the same volume as the documents:
+
+- **Restarts:** on startup, `queued` jobs and jobs interrupted mid-indexing
+  resume in upload order; nothing needs re-uploading. A job whose document
+  was already stored before the interruption is linked to it, not indexed
+  twice.
+- **Cleanup:** a job's PDF is deleted once it is `done`; failed jobs keep it
+  for retries. Job records are kept.
+- **Workers:** `PAGEINDEX_INDEX_WORKERS` sets how many documents are indexed at
+  once. Each document already makes many concurrent model calls, so raising it
+  multiplies provider load and the chance of rate limits; keep `1` unless your
+  provider has headroom.
+
+Chat, listing, and `/health` stay responsive while documents are indexed.
 
 ## CLI indexer
 
@@ -108,4 +157,4 @@ only (per-role overrides apply to the API).
 | `LLM Provider NOT provided` or wrong provider | Model ids containing `/` need the `openai/` prefix, e.g. `openai/meta-llama/Llama-3.3-70B-Instruct`. |
 | A placeholder model name reaches the provider | Model variables are used literally; leave them commented out to use the SDK defaults. |
 | `./results` files owned by root (Linux) | The image runs as root. Run `sudo chown -R "$USER" results`, or pass `--user "$(id -u):$(id -g)"` to `docker compose run`. |
-| 502 from `/chat` or `/documents` | Provider rejected the call; check `docker compose logs api`, the model name, base URL, and key. |
+| 502 from `/chat`, or a job `failed` with an upstream provider error | Provider rejected the call; check `docker compose logs api`, the model name, base URL, and key, then retry the job. |
