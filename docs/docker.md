@@ -117,7 +117,7 @@ All settings live in `.env`; see `.env.example` for the annotated list.
 | `PAGEINDEX_CHAT_BASE_URL`, `PAGEINDEX_CHAT_API_KEY` | `OPENAI_*` | Separate provider for chat (API) |
 | `PAGEINDEX_API_TOKEN` | unset (no auth) | Bearer token for every endpoint but `/health` |
 | `PAGEINDEX_PORT` | `8000` | Host port, bound on `127.0.0.1` only |
-| `PAGEINDEX_MAX_UPLOAD_MB` | `50` | Upload size limit; a finite number > 0 (e.g. `0.5`) |
+| `PAGEINDEX_MAX_UPLOAD_MB` | `50` | Upload size limit; a finite number > 0 that is at least 1 byte (e.g. `0.5`) |
 | `PAGEINDEX_INDEX_WORKERS` | `1` | Documents indexed in parallel; an integer >= 1 |
 
 An invalid `PAGEINDEX_MAX_UPLOAD_MB` or `PAGEINDEX_INDEX_WORKERS` stops the API

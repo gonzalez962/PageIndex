@@ -102,10 +102,14 @@ def _max_upload_bytes(env: Mapping[str, str]) -> int:
         mb = float(raw)
     except ValueError:
         mb = math.nan
-    if not math.isfinite(mb) or mb <= 0:
+    # A tiny positive value (e.g. 1e-9) would round down to 0 bytes and
+    # refuse every upload, so the converted limit must be at least 1 byte.
+    size = int(mb * 1024 * 1024) if math.isfinite(mb) and mb > 0 else 0
+    if size < 1:
         raise ValueError(
-            f"PAGEINDEX_MAX_UPLOAD_MB must be a finite number > 0, got {raw!r}")
-    return int(mb * 1024 * 1024)
+            "PAGEINDEX_MAX_UPLOAD_MB must be a finite number > 0 that is at "
+            f"least 1 byte (>= 1/1048576 MB), got {raw!r}")
+    return size
 
 
 def _index_workers(env: Mapping[str, str]) -> int:

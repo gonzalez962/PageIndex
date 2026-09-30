@@ -614,11 +614,19 @@ def test_index_workers_setting_is_validated(tmp_path):
     create_app(client=FakeClient(), env={**env, "PAGEINDEX_INDEX_WORKERS": "3"})
 
 
-@pytest.mark.parametrize("bad", ["0", "-1", "inf", "-inf", "nan", "big", "1e400"])
+@pytest.mark.parametrize("bad", ["0", "-1", "inf", "-inf", "nan", "big", "1e400",
+                                 # positive, but below one byte once converted
+                                 "1e-9", "5e-7", "1e-300"])
 def test_max_upload_setting_is_validated(tmp_path, bad):
     env = {"PAGEINDEX_STORAGE_PATH": str(tmp_path), "PAGEINDEX_MAX_UPLOAD_MB": bad}
     with pytest.raises(ValueError, match="PAGEINDEX_MAX_UPLOAD_MB.*> 0"):
         create_app(client=FakeClient(), env=env)
+
+
+def test_max_upload_accepts_exactly_one_byte(tmp_path):
+    env = {"PAGEINDEX_STORAGE_PATH": str(tmp_path),
+           "PAGEINDEX_MAX_UPLOAD_MB": repr(1 / (1024 * 1024))}
+    create_app(client=FakeClient(), env=env)
 
 
 def test_max_upload_accepts_fractional_megabytes(make):
