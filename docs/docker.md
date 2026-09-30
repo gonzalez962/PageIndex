@@ -4,6 +4,9 @@ Run PageIndex as an HTTP API against any OpenAI-compatible provider, with one
 model for indexing and another for chat, configured from `.env`. A one-shot
 CLI indexer is available under a compose profile.
 
+Requires Docker Compose >= 2.24 (`env_file` uses `required: false`); check
+with `docker compose version`.
+
 ## Quick path
 
 1. Configure the provider:
@@ -24,8 +27,12 @@ CLI indexer is available under a compose profile.
 
    ```bash
    curl -s http://127.0.0.1:8000/health
-   # {"status":"ok","index_model":"...","chat_model":"...","auth":true}
+   # {"status":"ok","client":"ok","index_model":"...","chat_model":"...","auth":true,...}
    ```
+
+   `/health` builds the model client; if that fails it answers 503 with
+   `"status":"error","client":"error"` and the container turns unhealthy.
+   The cause is in `docker compose logs api`.
 
 ## Use the API
 
@@ -73,7 +80,9 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/jobs/job-3f2a...
 | `done` | Indexed; `doc_id` is set |
 | `failed` | `error` says why; the PDF is kept for a retry |
 
-Retry a failed job after fixing the cause (e.g. the provider key):
+Retry a failed job after fixing the cause (e.g. the provider key). A job
+stuck in `processing` that no worker is running (its final state could not be
+saved) can be retried the same way:
 
 ```bash
 curl -s -X POST -H "Authorization: Bearer $TOKEN" \
@@ -86,13 +95,14 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 | Status | Meaning |
 |--------|---------|
 | 202 | Upload or retry accepted; follow the `Location` header to the job |
-| 400 | Not a PDF, or the SDK rejected the input |
+| 400 | Not a PDF, an invalid `Content-Length`, or the SDK rejected the input |
 | 401 | Missing or wrong bearer token |
 | 404 | Unknown document or job |
-| 409 | Retry of a job that is not `failed` |
-| 413 | Upload over `PAGEINDEX_MAX_UPLOAD_MB` |
+| 409 | Retry of a job that is queued, running, or already done |
+| 413 | Upload over `PAGEINDEX_MAX_UPLOAD_MB`; a declared `Content-Length` over the limit is refused before the body is read |
 | 415 | Not a `.pdf` file |
-| 502 | The model provider failed (model name, base URL, or key) |
+| 502 | The model provider failed (model name, base URL, or key); a `NotFoundError` adds a hint about the `openai/` prefix |
+| 503 | The model client cannot be built (check the logs), or the upload could not be stored (retry later) |
 
 ## Configuration
 
@@ -107,8 +117,11 @@ All settings live in `.env`; see `.env.example` for the annotated list.
 | `PAGEINDEX_CHAT_BASE_URL`, `PAGEINDEX_CHAT_API_KEY` | `OPENAI_*` | Separate provider for chat (API) |
 | `PAGEINDEX_API_TOKEN` | unset (no auth) | Bearer token for every endpoint but `/health` |
 | `PAGEINDEX_PORT` | `8000` | Host port, bound on `127.0.0.1` only |
-| `PAGEINDEX_MAX_UPLOAD_MB` | `50` | Upload size limit |
-| `PAGEINDEX_INDEX_WORKERS` | `1` | Documents indexed in parallel |
+| `PAGEINDEX_MAX_UPLOAD_MB` | `50` | Upload size limit; a finite number > 0 (e.g. `0.5`) |
+| `PAGEINDEX_INDEX_WORKERS` | `1` | Documents indexed in parallel; an integer >= 1 |
+
+An invalid `PAGEINDEX_MAX_UPLOAD_MB` or `PAGEINDEX_INDEX_WORKERS` stops the API
+at startup with a message naming the variable.
 
 Restart after editing `.env`: `docker compose up -d api`.
 
@@ -133,6 +146,10 @@ plus the PDF), so the queue lives in the same volume as the documents:
   once. Each document already makes many concurrent model calls, so raising it
   multiplies provider load and the chance of rate limits; keep `1` unless your
   provider has headroom.
+- **Single process:** the queue, the running-job set, and the startup cleanup
+  of half-written job directories are per-process. Run the API as one
+  process: do not add uvicorn `--workers` and do not scale the `api` service.
+  Raise `PAGEINDEX_INDEX_WORKERS` instead.
 
 Chat, listing, and `/health` stay responsive while documents are indexed.
 
@@ -157,4 +174,6 @@ only (per-role overrides apply to the API).
 | `LLM Provider NOT provided` or wrong provider | Model ids containing `/` need the `openai/` prefix, e.g. `openai/meta-llama/Llama-3.3-70B-Instruct`. |
 | A placeholder model name reaches the provider | Model variables are used literally; leave them commented out to use the SDK defaults. |
 | `./results` files owned by root (Linux) | The image runs as root. Run `sudo chown -R "$USER" results`, or pass `--user "$(id -u):$(id -g)"` to `docker compose run`. |
+| 503 "Model client is not configured", or `/health` 503 | The client could not be built from `.env`; `docker compose logs api` has the cause. Fix `.env`, then `docker compose up -d api`; the next request retries the build. |
+| 502 with `NotFoundError` | The provider does not know the model. If its id contains `/`, prefix it with `openai/` so it goes to `OPENAI_BASE_URL`. |
 | 502 from `/chat`, or a job `failed` with an upstream provider error | Provider rejected the call; check `docker compose logs api`, the model name, base URL, and key, then retry the job. |
