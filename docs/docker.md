@@ -174,6 +174,6 @@ only (per-role overrides apply to the API).
 | `LLM Provider NOT provided` or wrong provider | Model ids containing `/` need the `openai/` prefix, e.g. `openai/meta-llama/Llama-3.3-70B-Instruct`. |
 | A placeholder model name reaches the provider | Model variables are used literally; leave them commented out to use the SDK defaults. |
 | `./results` files owned by root (Linux) | The image runs as root. Run `sudo chown -R "$USER" results`, or pass `--user "$(id -u):$(id -g)"` to `docker compose run`. |
-| 503 "Model client is not configured", or `/health` 503 | The client could not be built from `.env`; `docker compose logs api` has the cause. Fix `.env`, then `docker compose up -d api`; the next request retries the build. |
+| 503 "Model client is not configured", or `/health` 503 | The client could not be built from `.env`; `docker compose logs api` has the cause. Fix `.env`, then `docker compose up -d api`. A running API retries a failed build at most every 30 s. |
 | 502 with `NotFoundError` | The provider does not know the model. If its id contains `/`, prefix it with `openai/` so it goes to `OPENAI_BASE_URL`. |
 | 502 from `/chat`, or a job `failed` with an upstream provider error | Provider rejected the call; check `docker compose logs api`, the model name, base URL, and key, then retry the job. |

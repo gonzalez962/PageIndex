@@ -188,9 +188,22 @@ class FlakyFactory:
         return self.client
 
 
-def _lazy_app(tmp_path, factory, env=None):
+class FakeClock:
+    """Monotonic clock the tests advance by hand."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def _lazy_app(tmp_path, factory, env=None, **kwargs):
     full_env = {"PAGEINDEX_STORAGE_PATH": str(tmp_path), **(env or {})}
-    return TestClient(create_app(env=full_env, client_factory=factory))
+    return TestClient(create_app(env=full_env, client_factory=factory, **kwargs))
 
 
 def test_health_reports_client_ok(make):
@@ -223,14 +236,71 @@ def test_health_is_503_when_client_cannot_be_built(tmp_path):
     assert "secret-detail" not in res.text and "ValueError" not in res.text
 
 
-def test_failed_client_build_is_retried_on_next_request(tmp_path):
-    factory = FlakyFactory()
-    api = _lazy_app(tmp_path, factory)
+def test_failed_client_build_is_retried_after_the_cooldown(tmp_path):
+    factory, clock = FlakyFactory(), FakeClock()
+    api = _lazy_app(tmp_path, factory, client_retry_after=30.0, clock=clock)
     assert api.get("/documents").status_code == 503
     factory.fixed = True
+    # Still inside the cooldown: fails fast without rebuilding.
+    assert api.get("/documents").status_code == 503
+    assert factory.calls == 1
+    clock.advance(30.0)
     assert api.get("/documents").status_code == 200
     assert api.get("/health").json()["client"] == "ok"
     assert factory.calls == 2
+
+
+def test_health_probes_do_not_rebuild_a_failed_client_within_cooldown(tmp_path):
+    factory, clock = FlakyFactory(), FakeClock()
+    api = _lazy_app(tmp_path, factory, client_retry_after=30.0, clock=clock)
+    for _ in range(5):
+        res = api.get("/health")
+        assert res.status_code == 503 and res.json()["client"] == "error"
+        clock.advance(5.0)
+    assert factory.calls == 1
+    clock.advance(10.0)  # 35 s after the failure
+    assert api.get("/health").status_code == 503
+    assert factory.calls == 2
+    factory.fixed = True
+    assert api.get("/health").status_code == 503  # new cooldown just started
+    clock.advance(30.0)
+    assert api.get("/health").status_code == 200
+    clock.advance(1000.0)
+    for _ in range(3):
+        assert api.get("/health").status_code == 200
+    assert factory.calls == 3
+
+
+def test_client_build_traceback_is_logged_once_per_failure_streak(tmp_path, caplog):
+    factory, clock = FlakyFactory(), FakeClock()
+    api = _lazy_app(tmp_path, factory, client_retry_after=30.0, clock=clock)
+    caplog.set_level("INFO", logger="pageindex.server")
+
+    def build_records():
+        return [r for r in caplog.records
+                if r.name == "pageindex.server" and "client" in r.getMessage()]
+
+    for _ in range(3):  # three failed builds in one streak
+        api.get("/health")
+        api.get("/health")  # inside the cooldown: no log at all
+        clock.advance(30.0)
+    records = build_records()
+    assert len(records) == 3
+    assert records[0].levelname == "ERROR" and records[0].exc_info
+    for rec in records[1:]:
+        assert rec.levelname == "WARNING" and not rec.exc_info
+        assert "ValueError" in rec.getMessage()
+        assert "secret-detail" not in rec.getMessage()
+
+    factory.fixed = True
+    assert api.get("/health").status_code == 200
+    recovered = build_records()[-1]
+    assert recovered.levelname == "INFO" and "recovered" in recovered.getMessage()
+
+    # Once built, the client is cached: no further builds or log lines.
+    caplog.clear()
+    assert api.get("/health").status_code == 200
+    assert build_records() == []
 
 
 # ---------- documents (queued upload) ----------

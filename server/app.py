@@ -27,6 +27,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Literal, Mapping, Optional, Union
 
@@ -45,6 +46,8 @@ logger = logging.getLogger("pageindex.server")
 DEFAULT_STORAGE_PATH = "/app/storage"
 DEFAULT_MAX_UPLOAD_MB = 50
 DEFAULT_INDEX_WORKERS = 1
+# Seconds a failed model client build is cached before it is tried again.
+CLIENT_RETRY_AFTER_SECONDS = 30.0
 _MAX_JOB_ERROR = 300
 _CHUNK = 1024 * 1024
 # Room for multipart boundaries and part headers around the file itself.
@@ -246,10 +249,14 @@ class _DeclaredUploadLimit:
 
 
 def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
-               client_factory: Callable[[Mapping[str, str]], Any] = build_client
+               client_factory: Callable[[Mapping[str, str]], Any] = build_client,
+               client_retry_after: float = CLIENT_RETRY_AFTER_SECONDS,
+               clock: Callable[[], float] = time.monotonic,
                ) -> FastAPI:
     """Build the API. Pass ``client`` to inject one (tests); otherwise it is
-    built from ``env`` on first use, so importing this module is cheap."""
+    built from ``env`` on first use, so importing this module is cheap. A
+    failed build is retried at most once per ``client_retry_after`` seconds
+    (measured with ``clock``)."""
     env = dict(os.environ if env is None else env)
     token = _set(env, "PAGEINDEX_API_TOKEN")
     max_upload = _max_upload_bytes(env)
@@ -257,21 +264,38 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
     workers = _index_workers(env)
     storage = _set(env, "PAGEINDEX_STORAGE_PATH") or DEFAULT_STORAGE_PATH
 
-    state = {"client": client}
+    # "failed_at"/"error" hold the last failed build. Within the cooldown every
+    # caller (including unauthenticated /health probes) fails fast instead of
+    # rebuilding the client and logging a traceback each time.
+    state = {"client": client, "failed_at": None, "error": None}
     client_lock = threading.Lock()
 
     def get_client():
         if state["client"] is None:
             with client_lock:
                 if state["client"] is None:
-                    try:
-                        built = client_factory(env)
-                    except Exception as exc:
-                        # Not cached: the next request tries the build again.
-                        logger.exception("Could not build the model client")
-                        raise ClientUnavailable(exc) from exc
-                    state["client"] = built
+                    _build_client_locked()
         return state["client"]
+
+    def _build_client_locked() -> None:
+        failed_at, error = state["failed_at"], state["error"]
+        if failed_at is not None and clock() - failed_at < client_retry_after:
+            raise ClientUnavailable(error) from error
+        try:
+            built = client_factory(env)
+        except Exception as exc:
+            if failed_at is None:
+                logger.exception("Could not build the model client")
+            else:
+                # Same failure streak: the traceback was already logged once.
+                logger.warning(
+                    "Could not build the model client (%s); retrying in %gs",
+                    type(exc).__name__, client_retry_after)
+            state["failed_at"], state["error"] = clock(), exc
+            raise ClientUnavailable(exc) from exc
+        if failed_at is not None:
+            logger.info("Model client recovered")
+        state["client"], state["failed_at"], state["error"] = built, None, None
 
     def require_token(request: Request) -> None:
         if token is None:
