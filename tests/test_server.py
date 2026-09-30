@@ -2,6 +2,8 @@
 
 A fake client stands in for the SDK so no model or PDF pipeline runs.
 """
+import asyncio
+import json
 import os
 import re
 import threading
@@ -296,6 +298,84 @@ def test_upload_rejects_oversize(make):
     res = upload(api, "big.pdf", PDF_BYTES + b"0" * (1024 * 1024))
     assert res.status_code == 413
     assert fake.submitted == []
+
+
+def _multipart(name, data, boundary="pageindex-test-boundary"):
+    crlf = "\r\n"
+    head = (f"--{boundary}{crlf}"
+            f"Content-Disposition: form-data; name=\"file\"; filename=\"{name}\"{crlf}"
+            f"Content-Type: application/pdf{crlf}{crlf}").encode()
+    tail = f"{crlf}--{boundary}--{crlf}".encode()
+    return head + data + tail, f"multipart/form-data; boundary={boundary}"
+
+
+def _raw_post(app, body_chunks, headers):
+    """Drive the ASGI app directly; reports whether the body was read."""
+    state = {"reads": 0, "status": None, "body": b""}
+    chunks = list(body_chunks)
+
+    async def receive():
+        state["reads"] += 1
+        if chunks:
+            chunk = chunks.pop(0)
+            return {"type": "http.request", "body": chunk, "more_body": bool(chunks)}
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            state["status"] = message["status"]
+        elif message["type"] == "http.response.body":
+            state["body"] += message.get("body", b"")
+
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": "POST", "scheme": "http", "path": "/documents",
+             "raw_path": b"/documents", "root_path": "", "query_string": b"",
+             "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+             "client": ("test", 1), "server": ("test", 80)}
+    asyncio.run(app(scope, receive, send))
+    return state
+
+
+def _upload_app(tmp_path, fake=None, mb="1"):
+    env = {"PAGEINDEX_STORAGE_PATH": str(tmp_path), "PAGEINDEX_MAX_UPLOAD_MB": mb}
+    return create_app(client=fake or FakeClient(), env=env)
+
+
+def test_oversized_content_length_is_413_before_body_is_read(tmp_path):
+    app = _upload_app(tmp_path)
+    body, ctype = _multipart("big.pdf", PDF_BYTES)
+    state = _raw_post(app, [body], {"content-type": ctype,
+                                    "content-length": str(2 * 1024 * 1024)})
+    assert state["status"] == 413
+    assert json.loads(state["body"])["detail"] == "Upload exceeds 1 MB."
+    assert state["reads"] == 0
+
+
+def test_invalid_content_length_is_400(tmp_path):
+    app = _upload_app(tmp_path)
+    for bad in ("abc", "-5"):
+        state = _raw_post(app, [b""], {"content-type": "multipart/form-data; boundary=x",
+                                       "content-length": bad})
+        assert state["status"] == 400
+        assert state["reads"] == 0
+
+
+def test_upload_within_declared_limit_reaches_the_handler(tmp_path):
+    app = _upload_app(tmp_path)
+    body, ctype = _multipart("ok.pdf", PDF_BYTES)
+    state = _raw_post(app, [body], {"content-type": ctype,
+                                    "content-length": str(len(body))})
+    assert state["status"] == 202
+    assert state["reads"] >= 1
+
+
+def test_oversized_upload_without_content_length_is_still_413(tmp_path):
+    app = _upload_app(tmp_path)
+    body, ctype = _multipart("big.pdf", PDF_BYTES + b"0" * (1024 * 1024 + 10))
+    size = 256 * 1024
+    chunks = [body[i:i + size] for i in range(0, len(body), size)]
+    state = _raw_post(app, chunks, {"content-type": ctype})
+    assert state["status"] == 413
 
 
 def test_rejected_uploads_create_no_job(make):

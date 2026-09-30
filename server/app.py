@@ -32,6 +32,7 @@ from typing import Any, Callable, Literal, Mapping, Optional, Union
 
 from fastapi import (Depends, FastAPI, File, HTTPException, Query, Request,
                      Response, UploadFile)
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -46,6 +47,8 @@ DEFAULT_MAX_UPLOAD_MB = 50
 DEFAULT_INDEX_WORKERS = 1
 _MAX_JOB_ERROR = 300
 _CHUNK = 1024 * 1024
+# Room for multipart boundaries and part headers around the file itself.
+_MULTIPART_MARGIN = 64 * 1024
 # Exceptions raised by these packages come from the model provider round trip.
 _UPSTREAM_MODULES = {"litellm", "openai", "httpx", "httpcore"}
 
@@ -207,6 +210,37 @@ def _safe_pdf_name(filename: Optional[str]) -> str:
     return name
 
 
+class _DeclaredUploadLimit:
+    """ASGI middleware: rejects ``POST <path>`` by its declared Content-Length
+    before any of the body is read, so an oversized upload is never parsed
+    or spooled to disk. Requests without Content-Length (chunked) fall
+    through to the handler's streaming size check."""
+
+    def __init__(self, app, path: str, max_bytes: int, detail: str):
+        self.app = app
+        self.path = path
+        self.max_bytes = max_bytes
+        self.detail = detail
+
+    async def __call__(self, scope, receive, send):
+        if (scope["type"] == "http" and scope["method"] == "POST"
+                and scope["path"] == self.path):
+            declared = next((value for key, value in scope["headers"]
+                             if key == b"content-length"), None)
+            if declared is not None:
+                rejection = None
+                if not re.fullmatch(rb"\d+", declared.strip()):
+                    rejection = (400, "Invalid Content-Length header.")
+                elif int(declared) > self.max_bytes:
+                    rejection = (413, self.detail)
+                if rejection is not None:
+                    status, detail = rejection
+                    response = JSONResponse({"detail": detail}, status_code=status)
+                    await response(scope, receive, send)
+                    return
+        await self.app(scope, receive, send)
+
+
 def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
                client_factory: Callable[[Mapping[str, str]], Any] = build_client
                ) -> FastAPI:
@@ -260,6 +294,8 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
             await run_in_threadpool(runner.stop)
 
     app = FastAPI(title="PageIndex API", version="1.0", lifespan=lifespan)
+    app.add_middleware(_DeclaredUploadLimit, path="/documents",
+                       max_bytes=max_upload + _MULTIPART_MARGIN, detail=too_large)
     protected = [Depends(require_token)]
 
     @app.get("/health")
