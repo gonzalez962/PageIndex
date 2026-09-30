@@ -27,7 +27,7 @@ package itself, web UI.
 
 ## Tasks
 - [x] T1 — Docker image, compose, `.env.example`, `.dockerignore` for the CLI indexer. Route: inline (4 small config files, already understood). Checks: image builds; `--help` runs; model reaches LiteLLM; requests hit `OPENAI_BASE_URL` (observed in container).
-- [ ] T2 — FastAPI service (`server/`) + tests: health, upload+index PDF, list/get documents, chat with separate chat model. Route: delegated writer (2+ non-trivial files). Checks: pytest `tests/test_server.py` inside Docker (host lacks deps); RED observed before GREEN.
+- [x] T2 — FastAPI service (`server/`) + tests: health, upload+index PDF, list/get documents, chat with separate chat model. Route: delegated writer (2+ non-trivial files). Checks: pytest `tests/test_server.py` inside Docker (host lacks deps); RED observed before GREEN.
 - [ ] T3 — Wire service into Docker/compose (`api` service, storage volume, port, CLI under a profile), update `.env.example`, add `docs/docker.md`. Route: delegated writer. Checks: `docker compose config`, image build, container `/health` responds.
 
 ## Acceptance criteria
@@ -40,7 +40,9 @@ package itself, web UI.
 - Branch: `feat/docker-http-api`.
 
 ## Progress / Evidence
-- T1: verified before branching (see checks above). Commit: pending.
+- T1: committed `1099663`. RDD assess: high (process_boundary, Dockerfile) -> consent granted -> 4-lens review approved, acknowledged (lineage review-5cfffa733b81615f, authority burned). Reviewed boundary advances to `1099663`.
+- T2: `server/app.py` (app factory `create_app(client=None, env=None)`, lazy client, env -> `client_kwargs`), `server/requirements.txt`, `tests/test_server.py`. Endpoints: `GET /health`, `POST|GET /documents`, `GET|DELETE /documents/{doc_id}`, `POST /chat`. Errors: SDK rejections 400, "not found" 404, provider errors (litellm/openai/httpx or `LLMRetriesExhausted` anywhere in the cause chain) 502 with the exception class only. Concurrency: plain `def` endpoints (threadpool); indexing serialized with a lock to bound provider load (the SDK store already locks its own writes); chat runs concurrently. RED: `ModuleNotFoundError: No module named 'server'` (collection error). GREEN: `tests/test_server.py` 21 passed; regression `tests/test_client.py tests/test_package_surface.py` 267 passed (both inside `pageindex:local`). Real `PageIndexClient` accepts the mapped kwargs (smoke). Commit: see git log (`feat(server): ...`).
+- T1 advisory findings folded into T2/T3: `.env.example` must mark models optional and ship them commented out; compose `env_file` should be `required: false`; `.dockerignore` excludes `tests/` (test runs mount the repo instead); document root-owned bind mounts; entrypoint arg handling gets a test in T3.
 
 ## Next step
-Commit T1, then delegate T2.
+T3: wire the service into Docker/compose and write `docs/docker.md`.
