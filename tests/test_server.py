@@ -170,6 +170,67 @@ def test_no_auth_when_token_unset(make):
     assert api.get("/documents").status_code == 200
 
 
+class FlakyFactory:
+    """client_factory that fails until ``fixed`` is set."""
+
+    def __init__(self, error=None):
+        self.error = error or ValueError("bad model config: secret-detail")
+        self.fixed = False
+        self.calls = 0
+        self.client = FakeClient()
+
+    def __call__(self, env):
+        self.calls += 1
+        if not self.fixed:
+            raise self.error
+        return self.client
+
+
+def _lazy_app(tmp_path, factory, env=None):
+    full_env = {"PAGEINDEX_STORAGE_PATH": str(tmp_path), **(env or {})}
+    return TestClient(create_app(env=full_env, client_factory=factory))
+
+
+def test_health_reports_client_ok(make):
+    api, _ = make()
+    res = api.get("/health")
+    assert res.status_code == 200
+    assert res.json()["client"] == "ok"
+
+
+def test_unbuildable_client_is_503_not_client_error(tmp_path):
+    factory = FlakyFactory()
+    api = _lazy_app(tmp_path, factory)
+    for res in (api.post("/chat", json={"question": "q"}),
+                api.get("/documents"),
+                api.get("/documents/pi-1"),
+                api.delete("/documents/pi-1")):
+        assert res.status_code == 503
+        detail = res.json()["detail"]
+        assert detail == ("Model client is not configured (ValueError); "
+                          "check the server logs.")
+        assert "secret-detail" not in res.text
+
+
+def test_health_is_503_when_client_cannot_be_built(tmp_path):
+    api = _lazy_app(tmp_path, FlakyFactory())
+    res = api.get("/health")
+    assert res.status_code == 503
+    body = res.json()
+    assert body["status"] == "error" and body["client"] == "error"
+    assert "secret-detail" not in res.text and "ValueError" not in res.text
+
+
+def test_failed_client_build_is_retried_on_next_request(tmp_path):
+    factory = FlakyFactory()
+    api = _lazy_app(tmp_path, factory)
+    assert api.get("/documents").status_code == 503
+    factory.fixed = True
+    assert api.get("/documents").status_code == 200
+    assert api.get("/health").json()["client"] == "ok"
+    assert factory.calls == 2
+
+
 # ---------- documents (queued upload) ----------
 
 def upload(api, name="report.pdf", data=PDF_BYTES, headers=None):

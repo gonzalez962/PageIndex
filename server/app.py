@@ -115,6 +115,15 @@ def _index_workers(env: Mapping[str, str]) -> int:
 
 # ---------- error mapping ----------
 
+class ClientUnavailable(Exception):
+    """The model client could not be built. A server-side configuration
+    problem, never the caller's input; the cause is logged, not returned."""
+
+    def __init__(self, cause: BaseException):
+        super().__init__(type(cause).__name__)
+        self.cause_name = type(cause).__name__
+
+
 def _is_upstream(exc: BaseException) -> bool:
     seen = set()
     while exc is not None and id(exc) not in seen:
@@ -130,6 +139,10 @@ def _is_upstream(exc: BaseException) -> bool:
 def _http_error(exc: Exception) -> HTTPException:
     """Translate an SDK failure. Upstream provider errors never echo their
     message: provider errors can quote request details."""
+    if isinstance(exc, ClientUnavailable):
+        return HTTPException(
+            503, f"Model client is not configured ({exc.cause_name}); "
+                 "check the server logs.")
     if _is_upstream(exc):
         root = exc
         while root.__cause__ is not None:
@@ -206,7 +219,13 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
         if state["client"] is None:
             with client_lock:
                 if state["client"] is None:
-                    state["client"] = client_factory(env)
+                    try:
+                        built = client_factory(env)
+                    except Exception as exc:
+                        # Not cached: the next request tries the build again.
+                        logger.exception("Could not build the model client")
+                        raise ClientUnavailable(exc) from exc
+                    state["client"] = built
         return state["client"]
 
     def require_token(request: Request) -> None:
@@ -237,9 +256,18 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
     protected = [Depends(require_token)]
 
     @app.get("/health")
-    def health() -> dict[str, Any]:
+    def health(response: Response) -> dict[str, Any]:
+        # 503 when the client cannot be built, so container healthchecks fail.
+        # The cause stays in the server logs.
+        try:
+            get_client()
+            client_state = "ok"
+        except ClientUnavailable:
+            client_state = "error"
+            response.status_code = 503
         return {
-            "status": "ok",
+            "status": "ok" if client_state == "ok" else "error",
+            "client": client_state,
             "index_model": _set(env, "PAGEINDEX_INDEX_MODEL"),
             "chat_model": _set(env, "PAGEINDEX_CHAT_MODEL"),
             "auth": token is not None,
