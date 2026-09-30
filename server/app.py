@@ -134,10 +134,17 @@ def _http_error(exc: Exception) -> HTTPException:
         root = exc
         while root.__cause__ is not None:
             root = root.__cause__
-        logger.error("Model provider call failed: %s", type(root).__name__)
-        return HTTPException(
-            502, f"Upstream model provider error ({type(root).__name__}). "
-                 "Check the model name, base URL and API key.")
+        name = type(root).__name__
+        logger.error("Model provider call failed: %s", name)
+        detail = (f"Upstream model provider error ({name}). "
+                  "Check the model name, base URL and API key.")
+        if name == "NotFoundError":
+            # A fixed hint, never the provider's text: model ids containing
+            # "/" are read by LiteLLM as "provider/model" unless prefixed.
+            detail += (" If the model id contains '/', prefix it with "
+                       "'openai/' (e.g. openai/vendor/model) so it is sent "
+                       "to OPENAI_BASE_URL.")
+        return HTTPException(502, detail)
     if isinstance(exc, PageIndexAPIError):
         message = str(exc)
         if "not found" in message.lower():

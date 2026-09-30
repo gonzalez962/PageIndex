@@ -537,6 +537,31 @@ def test_chat_upstream_failure_is_502_without_leaking(make):
     assert "FakeUpstreamError" in res.json()["detail"]
 
 
+def test_model_not_found_502_hints_the_openai_prefix(make):
+    class NotFoundError(Exception):
+        pass
+
+    NotFoundError.__module__ = "litellm.exceptions"
+    fake = FakeClient()
+    fake.chat_error = NotFoundError(
+        "'acme_p1/secret-model' routes through LiteLLM, but 'acme_p1' is "
+        "not a LiteLLM provider. key sk-leaky")
+    api, _ = make(client=fake)
+    res = api.post("/chat", json={"question": "q"})
+    assert res.status_code == 502
+    detail = res.json()["detail"]
+    assert "NotFoundError" in detail and "openai/" in detail
+    # The provider's own text is never echoed, only the fixed hint.
+    assert "sk-leaky" not in res.text and "acme_p1" not in res.text
+
+
+def test_other_upstream_errors_carry_no_model_hint(make):
+    fake = FakeClient()
+    fake.chat_error = FakeUpstreamError("boom")
+    api, _ = make(client=fake)
+    assert "openai/" not in api.post("/chat", json={"question": "q"}).json()["detail"]
+
+
 def test_chat_retries_exhausted_is_502(make):
     from pageindex.utils import LLMRetriesExhausted
 
