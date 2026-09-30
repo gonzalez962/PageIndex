@@ -8,10 +8,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+COPY server/requirements.txt server/requirements.txt
+RUN pip install -r requirements.txt -r server/requirements.txt
 
 COPY pageindex ./pageindex
 COPY run_pageindex.py .
+COPY server ./server
+
+# Runs as root on purpose: files written to bind mounts (./results) are then
+# root-owned on Linux hosts; see docs/docker.md. The HTTP API (compose
+# service "api") overrides this entrypoint with uvicorn.
 
 # PAGEINDEX_INDEX_MODEL (optional) becomes --index-model; every other argument
 # passes through to run_pageindex.py unchanged.
