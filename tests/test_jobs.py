@@ -305,6 +305,44 @@ def test_orphaned_processing_job_is_inactive_and_retryable(store, tmp_path, monk
         runner.stop(timeout=1.0)
 
 
+def test_retry_right_after_failure_is_not_refused(store, tmp_path, monkeypatch):
+    # The final status and leaving the active set must be one step: a retry
+    # issued the moment ``failed`` is on disk must not see the job as running.
+    written, proceed = threading.Event(), threading.Event()
+    update = store.update
+
+    def pausing_update(job_id, expect=None, **fields):
+        job = update(job_id, expect=expect, **fields)
+        if fields.get("status") == "failed" and not written.is_set():
+            written.set()
+            assert proceed.wait(5), "test never let the worker continue"
+        return job
+
+    monkeypatch.setattr(store, "update", pausing_update)
+
+    class _Rejecting(_BlockingClient):
+        def submit_document(self, path, metadata=None):
+            raise ValueError("bad pdf")
+
+    runner = JobRunner(store, lambda: _Rejecting(), lambda exc: str(exc))
+    runner.start()
+    try:
+        job = store.create("a.pdf", _upload(tmp_path))
+        runner.enqueue(job["id"])
+        assert written.wait(5)
+        result = []
+        retry = threading.Thread(target=lambda: result.append(runner.retry(job["id"])))
+        retry.start()
+        retry.join(0.3)  # without the fix, retry answers at once with None
+        proceed.set()
+        retry.join(5)
+        assert result and result[0] is not None
+        assert result[0]["status"] == "queued"
+    finally:
+        proceed.set()
+        runner.stop(timeout=1.0)
+
+
 def test_retry_refuses_running_queued_and_done_jobs(store, tmp_path):
     client = _BlockingClient()
     runner = _runner(store, client)

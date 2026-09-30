@@ -332,10 +332,19 @@ class JobRunner:
             self._store.delete_pdf(job_id)
 
     def _finish(self, job_id: str, **fields: Any) -> bool:
-        """Record the final state. If that write fails, try once to record
+        """Record the final state and leave the active set as one step under
+        the active lock, so ``retry`` never sees a final state on a job it
+        still counts as running. True if ``fields`` were recorded."""
+        with self._active_lock:
+            try:
+                return self._record(job_id, **fields)
+            finally:
+                self._active.discard(job_id)
+
+    def _record(self, job_id: str, **fields: Any) -> bool:
+        """Write the final state. If that write fails, try once to record
         ``failed`` instead; if that fails too the job stays ``processing``
-        with no worker, and ``retry`` can re-queue it. True if ``fields``
-        were recorded."""
+        with no worker, and ``retry`` can re-queue it."""
         try:
             self._store.update(job_id, **fields)
             return True
