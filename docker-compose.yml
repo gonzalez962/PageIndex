@@ -1,0 +1,9 @@
+services:
+  pageindex:
+    build: .
+    image: pageindex:local
+    env_file: .env
+    volumes:
+      # Put input documents in ./data; structures are written to ./results.
+      - ./data:/app/data:ro
+      - ./results:/app/results
