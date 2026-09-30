@@ -642,6 +642,60 @@ def test_auth_enforced_on_mutating_and_job_routes(make):
     assert api.get("/jobs", headers=ok).status_code == 200
 
 
+PROTECTED_ROUTES = [
+    ("post", "/documents"),
+    ("get", "/documents"),
+    ("get", "/documents/pi-1"),
+    ("delete", "/documents/pi-1"),
+    ("get", "/jobs"),
+    ("get", "/jobs/job-" + "0" * 32),
+    ("post", "/jobs/job-" + "0" * 32 + "/retry"),
+    ("post", "/chat"),
+]
+
+
+def _call(api, method, path, headers):
+    if path == "/documents" and method == "post":
+        return upload(api, headers=headers)
+    if path == "/chat":
+        return api.post(path, json={"question": "q"}, headers=headers)
+    return api.request(method.upper(), path, headers=headers)
+
+
+@pytest.mark.parametrize("method,path", PROTECTED_ROUTES)
+def test_every_non_health_route_requires_the_token(make, method, path):
+    api, _ = make({"PAGEINDEX_API_TOKEN": "tok"})
+    assert _call(api, method, path, {}).status_code == 401
+    assert _call(api, method, path, {"Authorization": "Bearer nope"}).status_code == 401
+    assert _call(api, method, path, {"Authorization": "Bearer tok"}).status_code != 401
+
+
+def test_lazy_client_is_built_once_across_concurrent_first_requests(tmp_path):
+    calls = []
+
+    def factory(env):
+        calls.append(env["PAGEINDEX_STORAGE_PATH"])
+        time.sleep(0.2)  # keep the build in flight while the others arrive
+        return FakeClient()
+
+    app = create_app(env={"PAGEINDEX_STORAGE_PATH": str(tmp_path)},
+                     client_factory=factory)
+    api = TestClient(app)
+    results = []
+
+    def hit():
+        results.append(api.get("/documents").status_code)
+
+    threads = [threading.Thread(target=hit) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert results == [200] * 5
+    assert calls == [str(tmp_path)]
+    assert api.get("/documents").status_code == 200 and len(calls) == 1
+
+
 def test_list_and_get_documents(make):
     api, _ = make()
     listing = api.get("/documents", params={"limit": 5}).json()
