@@ -534,6 +534,21 @@ def test_index_workers_setting_is_validated(tmp_path):
     create_app(client=FakeClient(), env={**env, "PAGEINDEX_INDEX_WORKERS": "3"})
 
 
+@pytest.mark.parametrize("bad", ["0", "-1", "inf", "-inf", "nan", "big", "1e400"])
+def test_max_upload_setting_is_validated(tmp_path, bad):
+    env = {"PAGEINDEX_STORAGE_PATH": str(tmp_path), "PAGEINDEX_MAX_UPLOAD_MB": bad}
+    with pytest.raises(ValueError, match="PAGEINDEX_MAX_UPLOAD_MB.*> 0"):
+        create_app(client=FakeClient(), env=env)
+
+
+def test_max_upload_accepts_fractional_megabytes(make):
+    api, fake = make({"PAGEINDEX_MAX_UPLOAD_MB": "0.5"})
+    res = upload(api, "big.pdf", PDF_BYTES + b"0" * (600 * 1024))
+    assert res.status_code == 413
+    assert res.json()["detail"] == "Upload exceeds 0.5 MB."
+    assert upload(api).status_code == 202
+
+
 def test_auth_enforced_on_mutating_and_job_routes(make):
     api, _ = make({"PAGEINDEX_API_TOKEN": "tok"})
     job = "/jobs/job-" + "0" * 32

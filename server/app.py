@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+import math
 import os
 import re
 import shutil
@@ -92,10 +93,15 @@ def build_client(env: Optional[Mapping[str, str]] = None,
 
 def _max_upload_bytes(env: Mapping[str, str]) -> int:
     raw = _set(env, "PAGEINDEX_MAX_UPLOAD_MB")
+    if raw is None:
+        return DEFAULT_MAX_UPLOAD_MB * 1024 * 1024
     try:
-        mb = float(raw) if raw else DEFAULT_MAX_UPLOAD_MB
+        mb = float(raw)
     except ValueError:
-        raise ValueError(f"PAGEINDEX_MAX_UPLOAD_MB must be a number, got {raw!r}")
+        mb = math.nan
+    if not math.isfinite(mb) or mb <= 0:
+        raise ValueError(
+            f"PAGEINDEX_MAX_UPLOAD_MB must be a finite number > 0, got {raw!r}")
     return int(mb * 1024 * 1024)
 
 
@@ -209,6 +215,7 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
     env = dict(os.environ if env is None else env)
     token = _set(env, "PAGEINDEX_API_TOKEN")
     max_upload = _max_upload_bytes(env)
+    too_large = f"Upload exceeds {max_upload / (1024 * 1024):g} MB."
     workers = _index_workers(env)
     storage = _set(env, "PAGEINDEX_STORAGE_PATH") or DEFAULT_STORAGE_PATH
 
@@ -287,7 +294,7 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
                     size += len(chunk)
                     if size > max_upload:
                         raise HTTPException(
-                            413, f"Upload exceeds {max_upload // (1024 * 1024)} MB.")
+                            413, too_large)
                     out.write(chunk)
             with open(path, "rb") as check:
                 if not check.read(5).startswith(b"%PDF-"):
