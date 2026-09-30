@@ -49,5 +49,8 @@ package itself, web UI.
 - Follow-ups (non-blocking advisory, not in this scope): R3-001 upload size limit applies after Starlette spools the full body (enforce at proxy or stream-parse); R3-002 client construction errors surface as 400 instead of 5xx, and /health does not build the client; R3-003 indexing lock holds threadpool workers (return 503/429 when busy); R3-004 validate `PAGEINDEX_MAX_UPLOAD_MB` (0, negative, inf); R3-005 tests for lazy factory path and auth on write routes; R3-006 document Docker Compose >= 2.24 for `env_file.required`.
 - Delivery: running count ~883 authored lines exceeds the ~400 budget; chain strategy (stacked-to-main or feature-branch-chain) to be chosen before any PR.
 
+- Live end-to-end (2026-09-30, user's OpenAI-compatible provider): first upload returned 502 `NotFoundError` because the model id `agy_p1/...` contains "/" and LiteLLM read `agy_p1` as the provider; with `openai/agy_p1/...` in `.env` a direct call returned `OK`. Then `POST /documents` (12-page PDF) -> 201 in ~42 s; `GET /documents` lists it with a model-written description; `POST /chat` -> 200 with a correct two-sentence answer in ~9 s; after `docker compose down` + `up -d api` the document is still listed (volume persistence).
+- Follow-up R3-007: the 502 body only names the exception class; for `NotFoundError` it could relay LiteLLM's own hint (it carries no secrets) so the `openai/` prefix fix is visible without reading code.
+
 ## Next step
-Implementation complete. Pending: live end-to-end check against the user's real provider (upload + chat); user decides on follow-ups and delivery (push/PR).
+Acceptance criteria met. User decides on follow-ups (R3-001..007) and delivery (chain strategy, push/PR).
