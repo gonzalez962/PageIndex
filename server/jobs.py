@@ -98,19 +98,26 @@ class JobStore:
         job_id = "job-" + uuid.uuid4().hex
         job_dir = os.path.join(self._root, job_id)
         os.makedirs(job_dir)
-        shutil.move(src_path, os.path.join(job_dir, name))
-        with self._lock:
-            now = _now()
-            # Keep creation order strict even when the clock is coarse.
-            if self._last_created is not None and now <= self._last_created:
-                now = self._last_created + timedelta(microseconds=1)
-            self._last_created = now
-            job = {"id": job_id, "name": name, "status": "queued",
-                   "created_at": _iso(now), "updated_at": _iso(now),
-                   "doc_id": None, "error": None, "attempts": 0}
-            # job.json is written last: a directory without it is ignored.
-            _write_json_atomic(os.path.join(job_dir, _JOB_FILE), job)
-            self._statuses[job_id] = "queued"
+        try:
+            shutil.move(src_path, os.path.join(job_dir, name))
+            with self._lock:
+                now = _now()
+                # Keep creation order strict even when the clock is coarse.
+                if self._last_created is not None and now <= self._last_created:
+                    now = self._last_created + timedelta(microseconds=1)
+                self._last_created = now
+                job = {"id": job_id, "name": name, "status": "queued",
+                       "created_at": _iso(now), "updated_at": _iso(now),
+                       "doc_id": None, "error": None, "attempts": 0}
+                # job.json is written last: a directory without it is ignored.
+                _write_json_atomic(os.path.join(job_dir, _JOB_FILE), job)
+                self._statuses[job_id] = "queued"
+        except BaseException:
+            # Do not leave an invisible directory (maybe holding the PDF).
+            with self._lock:
+                self._statuses.pop(job_id, None)
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise
         return job
 
     def get(self, job_id: str) -> Optional[dict]:
@@ -152,6 +159,7 @@ class JobStore:
         """Rebuild the status index after a (re)start: interrupted
         ``processing`` jobs go back to ``queued``. Returns the queued ids,
         oldest first, for the runner to enqueue."""
+        self._remove_orphan_dirs()
         pending = []
         with self._lock:
             self._statuses = {}
@@ -163,6 +171,22 @@ class JobStore:
             if job["status"] == "queued":
                 pending.append(job["id"])
         return pending
+
+    def _remove_orphan_dirs(self) -> None:
+        """Delete job directories without ``job.json``: leftovers of a crash
+        between moving the upload in and writing its record. Safe only
+        because ``recover()`` runs at startup, before any upload is
+        accepted, so no ``create`` can be mid-flight."""
+        try:
+            names = os.listdir(self._root)
+        except FileNotFoundError:
+            return
+        for name in names:
+            path = os.path.join(self._root, name)
+            if not _JOB_ID.match(name) or not os.path.isdir(path)                     or os.path.islink(path)                     or os.path.exists(os.path.join(path, _JOB_FILE)):
+                continue
+            logger.warning("Removing job directory without job.json: %s", name)
+            shutil.rmtree(path, ignore_errors=True)
 
     def counts(self) -> dict[str, int]:
         with self._lock:

@@ -257,7 +257,12 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
             with open(path, "rb") as check:
                 if not check.read(5).startswith(b"%PDF-"):
                     raise HTTPException(400, "File is not a PDF.")
-            job = jobs.create(name, path)
+            try:
+                job = jobs.create(name, path)
+            except OSError as exc:
+                logger.exception("Could not store upload as a job")
+                raise HTTPException(
+                    503, "Could not store the upload; try again later.") from exc
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
         runner.enqueue(job["id"])

@@ -79,6 +79,36 @@ def test_recover_requeues_interrupted_jobs_in_creation_order(store, tmp_path):
     assert fresh.counts() == {"queued": 2, "processing": 0}
 
 
+def test_create_cleans_up_when_job_record_cannot_be_written(store, tmp_path,
+                                                            monkeypatch):
+    kept = store.create("kept.pdf", _upload(tmp_path, "kept.pdf"))
+    root = os.path.dirname(os.path.dirname(store.pdf_path(kept["id"])))
+
+    def fail(path, data):
+        raise OSError("disk full")
+    monkeypatch.setattr("server.jobs._write_json_atomic", fail)
+    with pytest.raises(OSError):
+        store.create("a.pdf", _upload(tmp_path))
+    assert os.listdir(root) == [kept["id"]]
+    assert store.counts() == {"queued": 1, "processing": 0}
+
+
+def test_recover_removes_job_dirs_without_record(store, tmp_path):
+    job = store.create("a.pdf", _upload(tmp_path))
+    root = os.path.dirname(os.path.dirname(store.pdf_path(job["id"])))
+    orphan = os.path.join(root, "job-" + "e" * 32)
+    os.makedirs(orphan)
+    with open(os.path.join(orphan, "left.pdf"), "wb") as handle:
+        handle.write(PDF_BYTES)
+    os.makedirs(os.path.join(root, "not-a-job"))
+    with open(os.path.join(root, "notes.txt"), "w") as handle:
+        handle.write("keep me")
+
+    fresh = JobStore(root)
+    assert fresh.recover() == [job["id"]]
+    assert sorted(os.listdir(root)) == sorted([job["id"], "not-a-job", "notes.txt"])
+
+
 def test_missing_root_lists_nothing(tmp_path):
     store = JobStore(str(tmp_path / "absent"))
     assert store.list() == [] and store.recover() == []

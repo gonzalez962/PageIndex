@@ -2,6 +2,7 @@
 
 A fake client stands in for the SDK so no model or PDF pipeline runs.
 """
+import os
 import re
 import threading
 import time
@@ -241,6 +242,23 @@ def test_rejected_uploads_create_no_job(make):
     upload(api, "fake.pdf", b"not a pdf")
     upload(api, "notes.txt", b"hi")
     assert api.get("/jobs").json()["total"] == 0
+
+
+def test_upload_storage_failure_is_503_and_leaves_no_job(make, tmp_path,
+                                                        monkeypatch):
+    api, fake = make()
+
+    def fail(path, data):
+        raise OSError("disk full at /secret/path")
+    monkeypatch.setattr("server.jobs._write_json_atomic", fail)
+    res = upload(api)
+    assert res.status_code == 503
+    assert res.json()["detail"] == "Could not store the upload; try again later."
+    assert "/secret/path" not in res.text
+    jobs_root = tmp_path / "jobs"
+    assert not jobs_root.exists() or os.listdir(jobs_root) == []
+    assert api.get("/health").json()["queue"] == {"queued": 0, "processing": 0}
+    assert fake.submitted == []
 
 
 def test_upload_strips_path_components_from_filename(make):
