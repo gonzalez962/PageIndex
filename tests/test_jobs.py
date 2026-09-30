@@ -100,13 +100,45 @@ def test_recover_removes_job_dirs_without_record(store, tmp_path):
     os.makedirs(orphan)
     with open(os.path.join(orphan, "left.pdf"), "wb") as handle:
         handle.write(PDF_BYTES)
+    _age(orphan, seconds=3600)
     os.makedirs(os.path.join(root, "not-a-job"))
+    _age(os.path.join(root, "not-a-job"), seconds=3600)
     with open(os.path.join(root, "notes.txt"), "w") as handle:
         handle.write("keep me")
 
     fresh = JobStore(root)
     assert fresh.recover() == [job["id"]]
     assert sorted(os.listdir(root)) == sorted([job["id"], "not-a-job", "notes.txt"])
+
+
+def _age(path, seconds):
+    past = time.time() - seconds
+    os.utime(path, (past, past))
+
+
+def test_recover_keeps_recent_job_dirs_without_record(store, tmp_path):
+    job = store.create("a.pdf", _upload(tmp_path))
+    root = os.path.dirname(os.path.dirname(store.pdf_path(job["id"])))
+    recent = os.path.join(root, "job-" + "d" * 32)
+    old = os.path.join(root, "job-" + "e" * 32)
+    for path in (recent, old):
+        os.makedirs(path)
+    _age(recent, seconds=30)
+    _age(old, seconds=120)
+
+    fresh = JobStore(root, orphan_grace=60)
+    assert fresh.recover() == [job["id"]]
+    assert sorted(os.listdir(root)) == sorted([job["id"], os.path.basename(recent)])
+
+
+def test_default_orphan_grace_keeps_a_just_created_dir(store, tmp_path):
+    job = store.create("a.pdf", _upload(tmp_path))
+    root = os.path.dirname(os.path.dirname(store.pdf_path(job["id"])))
+    in_flight = os.path.join(root, "job-" + "c" * 32)
+    os.makedirs(in_flight)
+
+    JobStore(root).recover()
+    assert os.path.isdir(in_flight)
 
 
 def test_missing_root_lists_nothing(tmp_path):

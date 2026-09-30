@@ -4,6 +4,10 @@ Each upload becomes a job directory under ``<storage>/jobs/<job_id>/`` holding
 ``job.json`` and the uploaded PDF. Because the queue lives on disk, pending
 work survives restarts: ``JobStore.recover()`` re-queues it and
 ``JobRunner`` indexes it on background threads outside the HTTP threadpool.
+
+Designed for a single server process: the status index, the active-job set
+and the orphan sweep in ``recover()`` are per-process, so run one uvicorn
+worker and one replica per storage directory.
 """
 from __future__ import annotations
 
@@ -24,6 +28,9 @@ logger = logging.getLogger("pageindex.server.jobs")
 STATUSES = ("queued", "processing", "done", "failed")
 _JOB_ID = re.compile(r"^job-[0-9a-f]{32}$")
 _JOB_FILE = "job.json"
+# Job directories without job.json younger than this are left alone by the
+# orphan sweep: they may belong to an upload another process is storing.
+ORPHAN_GRACE_SECONDS = 10 * 60
 _UNSAVED_RESULT = ("Indexing finished but the result could not be saved; "
                    "retry to recover.")
 
@@ -57,8 +64,9 @@ class JobStore:
     one lock, so transitions (claim, retry) are race-free in this process.
     An in-memory status index keeps ``counts()`` cheap for ``/health``."""
 
-    def __init__(self, root: str):
+    def __init__(self, root: str, orphan_grace: float = ORPHAN_GRACE_SECONDS):
         self._root = root
+        self._orphan_grace = orphan_grace
         self._lock = threading.Lock()
         self._statuses: dict[str, str] = {}
         self._last_created: Optional[datetime] = None
@@ -174,16 +182,25 @@ class JobStore:
 
     def _remove_orphan_dirs(self) -> None:
         """Delete job directories without ``job.json``: leftovers of a crash
-        between moving the upload in and writing its record. Safe only
-        because ``recover()`` runs at startup, before any upload is
-        accepted, so no ``create`` can be mid-flight."""
+        between moving the upload in and writing its record. ``recover()``
+        runs at startup, before this process accepts uploads; directories
+        modified within the grace period are kept anyway, as a guard in case
+        a second process shares the storage (unsupported: see module doc)."""
         try:
             names = os.listdir(self._root)
         except FileNotFoundError:
             return
+        cutoff = time.time() - self._orphan_grace
         for name in names:
             path = os.path.join(self._root, name)
-            if not _JOB_ID.match(name) or not os.path.isdir(path)                     or os.path.islink(path)                     or os.path.exists(os.path.join(path, _JOB_FILE)):
+            if (not _JOB_ID.match(name) or not os.path.isdir(path)
+                    or os.path.islink(path)
+                    or os.path.exists(os.path.join(path, _JOB_FILE))):
+                continue
+            try:
+                if os.path.getmtime(path) > cutoff:
+                    continue
+            except OSError:
                 continue
             logger.warning("Removing job directory without job.json: %s", name)
             shutil.rmtree(path, ignore_errors=True)

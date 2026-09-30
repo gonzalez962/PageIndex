@@ -11,6 +11,8 @@ services:
   # HTTP API: docker compose up -d api
   api:
     <<: *pageindex
+    # Must stay a single process: the job queue and the orphan sweep are
+    # per-process. Do not add --workers or scale this service.
     entrypoint: ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       # Loopback only. Set PAGEINDEX_API_TOKEN before exposing it further.
