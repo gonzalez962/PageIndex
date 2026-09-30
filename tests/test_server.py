@@ -317,7 +317,69 @@ def test_failed_job_can_be_retried(make):
 def test_retry_rejects_queued_job(make):
     api, _ = make()
     job_id = upload(api).json()["job_id"]  # no lifespan: the job stays queued
-    assert api.post(f"/jobs/{job_id}/retry").status_code == 409
+    res = api.post(f"/jobs/{job_id}/retry")
+    assert res.status_code == 409
+    assert res.json()["detail"] == "Job is queued, running, or already done."
+
+
+def test_retry_rejects_running_job(make):
+    fake = FakeClient()
+    fake.gate = threading.Event()
+    api, _ = make(client=fake)
+    with api:
+        try:
+            job_id = upload(api).json()["job_id"]
+            wait_for_status(api, job_id, "processing")
+            assert api.post(f"/jobs/{job_id}/retry").status_code == 409
+        finally:
+            fake.gate.set()
+        job = wait_for_status(api, job_id, "done")
+    assert job["attempts"] == 1 and len(fake.submitted) == 1
+
+
+class IndexingClient(FakeClient):
+    """Fake client that keeps submitted documents listable with metadata."""
+
+    def submit_document(self, file_path, metadata=None):
+        result = super().submit_document(file_path, metadata)
+        self.docs[result["doc_id"]] = {"id": result["doc_id"],
+                                       "name": "report.pdf", "metadata": metadata}
+        return result
+
+
+def test_job_whose_final_state_was_not_saved_can_be_retried(make, monkeypatch):
+    import os
+
+    from server.jobs import JobStore
+
+    original = JobStore.update
+    left = [2]  # the ``done`` write and the fallback ``failed`` write
+
+    def update(self, job_id, expect=None, **fields):
+        if fields.get("status") in ("done", "failed") and left[0] > 0:
+            left[0] -= 1
+            raise OSError("No space left on device")
+        return original(self, job_id, expect=expect, **fields)
+
+    monkeypatch.setattr(JobStore, "update", update)
+    fake = IndexingClient()
+    api, _ = make(client=fake)
+    with api:
+        job_id = upload(api).json()["job_id"]
+        # The job stays ``processing`` with no worker; retry succeeds once
+        # the worker has let go of it (409 while it still runs).
+        deadline = time.monotonic() + 5
+        while (res := api.post(f"/jobs/{job_id}/retry")).status_code != 202:
+            assert res.status_code == 409
+            assert time.monotonic() < deadline, api.get(f"/jobs/{job_id}").json()
+            time.sleep(0.02)
+        assert left == [0]
+        assert res.json()["status"] == "queued"
+        job = wait_for_status(api, job_id, "done")
+    # The re-run found the document through its job_id metadata.
+    assert job["doc_id"] == "pi-new" and job["attempts"] == 2
+    assert len(fake.submitted) == 1
+    assert not os.path.exists(fake.submitted[0][0])
 
 
 def test_list_jobs_newest_first_with_filter_and_paging(make):

@@ -189,3 +189,109 @@ def test_start_after_stop_processes_new_jobs(store, tmp_path):
         _wait_status(store, job["id"], "done")
     finally:
         runner.stop(timeout=1.0)
+
+
+# ---------- JobRunner final-state write failures ----------
+
+def _fail_final_writes(monkeypatch, store, times):
+    """Make the next ``times`` writes of a ``done``/``failed`` status raise."""
+    original = store.update
+    left = [times]
+
+    def update(job_id, expect=None, **fields):
+        if fields.get("status") in ("done", "failed") and left[0] > 0:
+            left[0] -= 1
+            raise OSError("No space left on device")
+        return original(job_id, expect=expect, **fields)
+
+    monkeypatch.setattr(store, "update", update)
+    return left
+
+
+def test_unsaved_done_is_recorded_as_failed_and_pdf_kept(store, tmp_path, monkeypatch):
+    left = _fail_final_writes(monkeypatch, store, times=1)
+    client = _BlockingClient()
+    client.release.set()
+    runner = _runner(store, client)
+    runner.start()
+    try:
+        first = store.create("a.pdf", _upload(tmp_path, "a.pdf"))
+        runner.enqueue(first["id"])
+        _wait_status(store, first["id"], "failed")
+        job = store.get(first["id"])
+        assert "could not be saved" in job["error"] and job["doc_id"] is None
+        assert os.path.exists(store.pdf_path(first["id"]))
+        assert left == [0]
+        # The worker survives and keeps indexing later jobs.
+        second = store.create("b.pdf", _upload(tmp_path, "b.pdf"))
+        runner.enqueue(second["id"])
+        _wait_status(store, second["id"], "done")
+    finally:
+        runner.stop(timeout=1.0)
+
+
+def test_unsaved_failure_keeps_original_error(store, tmp_path, monkeypatch):
+    _fail_final_writes(monkeypatch, store, times=1)
+
+    class _Rejecting(_BlockingClient):
+        def submit_document(self, path, metadata=None):
+            raise ValueError("bad pdf")
+
+    runner = JobRunner(store, lambda: _Rejecting(), lambda exc: str(exc))
+    runner.start()
+    try:
+        job = store.create("a.pdf", _upload(tmp_path))
+        runner.enqueue(job["id"])
+        _wait_status(store, job["id"], "failed")
+        assert store.get(job["id"])["error"] == "bad pdf"
+    finally:
+        runner.stop(timeout=1.0)
+
+
+def test_orphaned_processing_job_is_inactive_and_retryable(store, tmp_path, monkeypatch):
+    left = _fail_final_writes(monkeypatch, store, times=2)
+    client = _BlockingClient()
+    client.release.set()
+    runner = _runner(store, client)
+    runner.start()
+    try:
+        first = store.create("a.pdf", _upload(tmp_path, "a.pdf"))
+        runner.enqueue(first["id"])
+        deadline = time.monotonic() + 5
+        while left[0] or runner.is_active(first["id"]):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert store.get(first["id"])["status"] == "processing"
+        assert os.path.exists(store.pdf_path(first["id"]))
+        # The worker survived both failed writes.
+        second = store.create("b.pdf", _upload(tmp_path, "b.pdf"))
+        runner.enqueue(second["id"])
+        _wait_status(store, second["id"], "done")
+
+        assert runner.retry(first["id"])["status"] == "queued"
+        _wait_status(store, first["id"], "done")
+        assert store.get(first["id"])["attempts"] == 2
+    finally:
+        runner.stop(timeout=1.0)
+
+
+def test_retry_refuses_running_queued_and_done_jobs(store, tmp_path):
+    client = _BlockingClient()
+    runner = _runner(store, client)
+    running = store.create("a.pdf", _upload(tmp_path, "a.pdf"))
+    waiting = store.create("b.pdf", _upload(tmp_path, "b.pdf"))
+    runner.start()
+    try:
+        client.wait_submitted(1)
+        assert runner.is_active(running["id"])
+        assert runner.retry(running["id"]) is None
+        assert runner.retry(waiting["id"]) is None
+        client.release.set()
+        _wait_status(store, running["id"], "done")
+        _wait_status(store, waiting["id"], "done")
+        assert not runner.is_active(running["id"])
+        assert runner.retry(running["id"]) is None
+        assert store.get(running["id"])["attempts"] == 1
+    finally:
+        client.release.set()
+        runner.stop(timeout=1.0)

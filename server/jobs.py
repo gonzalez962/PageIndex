@@ -24,6 +24,8 @@ logger = logging.getLogger("pageindex.server.jobs")
 STATUSES = ("queued", "processing", "done", "failed")
 _JOB_ID = re.compile(r"^job-[0-9a-f]{32}$")
 _JOB_FILE = "job.json"
+_UNSAVED_RESULT = ("Indexing finished but the result could not be saved; "
+                   "retry to recover.")
 
 
 def _now() -> datetime:
@@ -196,6 +198,10 @@ class JobRunner:
         self._queue: "queue.Queue[Optional[str]]" = queue.Queue()
         self._stopping = threading.Event()
         self._threads: list[threading.Thread] = []
+        # Ids of jobs a worker is running right now. Guarded by its own lock,
+        # always taken before the store lock (never the reverse).
+        self._active: set[str] = set()
+        self._active_lock = threading.Lock()
 
     def start(self) -> None:
         # Fresh queue and flag per start, so a stopped runner can restart
@@ -229,6 +235,25 @@ class JobRunner:
     def enqueue(self, job_id: str) -> None:
         self._queue.put(job_id)
 
+    def is_active(self, job_id: str) -> bool:
+        with self._active_lock:
+            return job_id in self._active
+
+    def retry(self, job_id: str) -> Optional[dict]:
+        """Re-queue a ``failed`` job, or a ``processing`` job no worker is
+        running (its final state could not be saved). Returns None for any
+        other job. Unknown id: KeyError."""
+        with self._active_lock:
+            if job_id in self._active:
+                return None
+            # Holding the active lock keeps a worker from claiming the job
+            # between the check above and the transition below.
+            job = self._store.update(job_id, expect=("failed", "processing"),
+                                     status="queued", error=None)
+        if job is not None:
+            self.enqueue(job_id)
+        return job
+
     def _loop(self, jobs: "queue.Queue[Optional[str]]",
               stopping: threading.Event) -> None:
         while True:
@@ -241,6 +266,17 @@ class JobRunner:
                 logger.exception("Job %s: unexpected runner failure", job_id)
 
     def _run(self, job_id: str) -> None:
+        with self._active_lock:
+            if job_id in self._active:
+                return  # another worker holds it: a duplicate queue entry
+            self._active.add(job_id)
+        try:
+            self._index(job_id)
+        finally:
+            with self._active_lock:
+                self._active.discard(job_id)
+
+    def _index(self, job_id: str) -> None:
         job = self._store.get(job_id)
         if job is None:
             return
@@ -265,7 +301,27 @@ class JobRunner:
         except Exception as exc:
             error = self._describe_error(exc)
             logger.warning("Job %s failed: %s", job_id, error)
-            self._store.update(job_id, status="failed", error=error)
+            self._finish(job_id, status="failed", error=error)
             return
-        self._store.update(job_id, status="done", doc_id=doc_id)
-        self._store.delete_pdf(job_id)
+        # Keep the PDF unless ``done`` is on disk: a retry may still need it.
+        if self._finish(job_id, status="done", doc_id=doc_id):
+            self._store.delete_pdf(job_id)
+
+    def _finish(self, job_id: str, **fields: Any) -> bool:
+        """Record the final state. If that write fails, try once to record
+        ``failed`` instead; if that fails too the job stays ``processing``
+        with no worker, and ``retry`` can re-queue it. True if ``fields``
+        were recorded."""
+        try:
+            self._store.update(job_id, **fields)
+            return True
+        except Exception:
+            logger.exception("Job %s: could not record status %s",
+                             job_id, fields["status"])
+        try:
+            self._store.update(job_id, status="failed",
+                               error=fields.get("error") or _UNSAVED_RESULT)
+        except Exception:
+            logger.exception("Job %s: could not record the failure either; "
+                             "it stays processing until retried", job_id)
+        return False

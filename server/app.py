@@ -285,10 +285,11 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
     @app.post("/jobs/{job_id}/retry", status_code=202, dependencies=protected)
     def retry_job(job_id: str, response: Response) -> dict[str, Any]:
         _job_or_404(job_id)
-        job = jobs.update(job_id, expect=("failed",), status="queued", error=None)
+        # Failed jobs, and processing jobs no worker is running (their final
+        # state could not be saved), go back to the queue.
+        job = runner.retry(job_id)
         if job is None:
-            raise HTTPException(409, "Only failed jobs can be retried.")
-        runner.enqueue(job_id)
+            raise HTTPException(409, "Job is queued, running, or already done.")
         response.headers["Location"] = f"/jobs/{job_id}"
         return job
 
