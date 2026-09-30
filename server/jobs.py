@@ -14,6 +14,7 @@ import queue
 import re
 import shutil
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -193,33 +194,46 @@ class JobRunner:
         self._describe_error = describe_error
         self._workers = workers
         self._queue: "queue.Queue[Optional[str]]" = queue.Queue()
+        self._stopping = threading.Event()
         self._threads: list[threading.Thread] = []
 
     def start(self) -> None:
+        # Fresh queue and flag per start, so a stopped runner can restart
+        # while any old worker still finishing a job keeps its own pair.
+        self._queue = queue.Queue()
+        self._stopping = threading.Event()
         for job_id in self._store.recover():
             self._queue.put(job_id)
         for num in range(self._workers):
-            thread = threading.Thread(target=self._loop, daemon=True,
+            thread = threading.Thread(target=self._loop,
+                                      args=(self._queue, self._stopping),
+                                      daemon=True,
                                       name=f"pageindex-indexer-{num}")
             thread.start()
             self._threads.append(thread)
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Ask workers to exit after their current job. A job still running
-        at shutdown stays ``processing`` on disk and resumes on next start."""
+        """Ask workers to exit after their current job, claiming no new one:
+        jobs still queued stay ``queued`` on disk. Waits at most ``timeout``
+        seconds in total. A job still running at shutdown keeps going on its
+        daemon thread and, if unfinished, stays ``processing`` on disk and
+        resumes on next start."""
+        self._stopping.set()
         for _ in self._threads:
-            self._queue.put(None)
+            self._queue.put(None)  # wake workers idle on get()
+        deadline = time.monotonic() + timeout
         for thread in self._threads:
-            thread.join(timeout)
+            thread.join(max(0.0, deadline - time.monotonic()))
         self._threads = []
 
     def enqueue(self, job_id: str) -> None:
         self._queue.put(job_id)
 
-    def _loop(self) -> None:
+    def _loop(self, jobs: "queue.Queue[Optional[str]]",
+              stopping: threading.Event) -> None:
         while True:
-            job_id = self._queue.get()
-            if job_id is None:
+            job_id = jobs.get()
+            if job_id is None or stopping.is_set():
                 return
             try:
                 self._run(job_id)

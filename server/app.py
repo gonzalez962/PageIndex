@@ -32,6 +32,7 @@ from typing import Any, Callable, Literal, Mapping, Optional, Union
 from fastapi import (Depends, FastAPI, File, HTTPException, Query, Request,
                      Response, UploadFile)
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from pageindex import PageIndexAPIError
 from pageindex.utils import LLMRetriesExhausted
@@ -222,7 +223,8 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
         try:
             yield
         finally:
-            runner.stop()
+            # stop() joins worker threads; keep that off the event loop.
+            await run_in_threadpool(runner.stop)
 
     app = FastAPI(title="PageIndex API", version="1.0", lifespan=lifespan)
     protected = [Depends(require_token)]
