@@ -164,6 +164,8 @@ def _is_unrecoverable(exc: Exception) -> bool:
 
 
 def llm_completion(model, prompt, chat_history=None, return_finish_reason=False):
+    """``prompt`` is the user message content: a string, or a list of
+    OpenAI-style content parts (text and ``image_url``) for vision calls."""
     import litellm
     max_retries = 10
     messages = list(chat_history) + [{"role": "user", "content": prompt}] if chat_history else [{"role": "user", "content": prompt}]
@@ -201,6 +203,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
 
 
 async def llm_acompletion(model, prompt):
+    """Async llm_completion; ``prompt`` may also be a list of content parts."""
     import litellm
     max_retries = 10
     messages = [{"role": "user", "content": prompt}]
