@@ -395,3 +395,9 @@ def test_retry_refuses_running_queued_and_done_jobs(store, tmp_path):
     finally:
         client.release.set()
         runner.stop(timeout=1.0)
+
+
+def test_create_accepts_image_names(store, tmp_path):
+    job = store.create("scan.png", _upload(tmp_path, "scan.png"))
+    assert os.path.basename(store.pdf_path(job["id"])) == "scan.png"
+    assert job["name"] == "scan.png"

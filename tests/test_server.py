@@ -857,3 +857,80 @@ def test_chat_retries_exhausted_is_502(make):
     fake.chat_error = LLMRetriesExhausted("gave up", status_code=503)
     api, _ = make(client=fake)
     assert api.post("/chat", json={"question": "q"}).status_code == 502
+
+
+# ---------- images and OCR ----------
+
+def _png_bytes(fmt="PNG"):
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (40, 30), "white").save(buf, fmt)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("name,fmt", [("scan.png", "PNG"), ("photo.JPG", "JPEG"),
+                                      ("page.tiff", "TIFF"), ("pic.webp", "WEBP")])
+def test_upload_accepts_images(make, name, fmt):
+    api, fake = make()
+    data = _png_bytes(fmt)
+    with api:
+        res = upload(api, name, data)
+        assert res.status_code == 202
+        assert res.json()["name"] == name
+        wait_for_status(api, res.json()["job_id"], "done")
+    path, submitted = fake.submitted[0]
+    assert os.path.basename(path) == name
+    assert submitted == data
+
+
+def test_upload_rejects_disguised_image(make):
+    api, fake = make()
+    for name, data in (("scan.png", PDF_BYTES), ("scan.jpg", b"not an image")):
+        res = upload(api, name, data)
+        assert res.status_code == 400
+        assert "not a supported image" in res.json()["detail"]
+    assert fake.submitted == []
+    assert api.get("/jobs").json()["total"] == 0
+
+
+def test_upload_rejects_unsupported_types(make):
+    api, fake = make()
+    for name in ("notes.txt", "icon.ico", "scan.svg", ".png"):
+        res = upload(api, name, _png_bytes())
+        assert res.status_code == 415
+        assert "PDF or image" in res.json()["detail"]
+    assert fake.submitted == []
+
+
+def test_image_upload_keeps_the_size_limit(make):
+    api, fake = make(env={"PAGEINDEX_MAX_UPLOAD_MB": repr(100 / (1024 * 1024))})
+    res = api.post("/documents", files={"file": ("big.png", _png_bytes() + b"\0" * 200,
+                                                 "image/png")})
+    assert res.status_code == 413
+    assert fake.submitted == []
+
+
+def test_client_kwargs_carry_ocr_settings():
+    kwargs = client_kwargs({"PAGEINDEX_OCR": " Force ",
+                            "PAGEINDEX_OCR_MODEL": "openai/gpt-4o"})
+    assert kwargs["ocr"] == "force"
+    assert kwargs["ocr_model"] == "openai/gpt-4o"
+    assert "ocr" not in client_kwargs({"PAGEINDEX_OCR": ""})
+
+
+def test_ocr_setting_is_validated(tmp_path):
+    env = {"PAGEINDEX_STORAGE_PATH": str(tmp_path), "PAGEINDEX_OCR": "always"}
+    with pytest.raises(ValueError, match="PAGEINDEX_OCR must be one of off, auto, force"):
+        create_app(client=FakeClient(), env=env)
+    with pytest.raises(ValueError, match="PAGEINDEX_OCR"):
+        client_kwargs({"PAGEINDEX_OCR": "always"})
+    create_app(client=FakeClient(), env={**env, "PAGEINDEX_OCR": "off"})
+
+
+def test_ocr_settings_reach_the_real_client(tmp_path):
+    from server.app import build_client
+    client = build_client({"PAGEINDEX_STORAGE_PATH": str(tmp_path),
+                           "PAGEINDEX_OCR": "off",
+                           "PAGEINDEX_OCR_MODEL": "openai/gpt-4o"})
+    assert (client._api._ocr, client._api._ocr_model) == ("off", "openai/gpt-4o")

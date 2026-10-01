@@ -102,7 +102,8 @@ class JobStore:
 
     def create(self, name: str, src_path: str) -> dict:
         """Move the validated upload at ``src_path`` into a new queued job.
-        ``name`` must already be a bare, safe ``.pdf`` file name."""
+        ``name`` must already be a bare, safe upload file name (a PDF or
+        a supported image)."""
         job_id = "job-" + uuid.uuid4().hex
         job_dir = os.path.join(self._root, job_id)
         os.makedirs(job_dir)

@@ -11,6 +11,12 @@ Configuration comes from the environment (see .env.example):
   ``Authorization: Bearer <token>``.
 - PAGEINDEX_MAX_UPLOAD_MB: upload size limit (default 50).
 - PAGEINDEX_INDEX_WORKERS: documents indexed in parallel (default 1).
+- PAGEINDEX_OCR: off, auto (default) or force — OCR through the index
+  model's vision input for scanned pages, figures and image uploads.
+- PAGEINDEX_OCR_MODEL: vision model for OCR (default: the index model).
+
+Uploads are PDFs or images (png, jpg, jpeg, webp, tif, tiff, bmp, gif),
+checked by extension and by content.
 
 Uploads are queued as jobs under ``<storage>/jobs`` and indexed in the
 background (see server/jobs.py); poll ``GET /jobs/{job_id}`` for the result.
@@ -38,6 +44,8 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from pageindex import PageIndexAPIError
+from pageindex.ocr import (IMAGE_EXTENSIONS, OCR_MODES, has_image_extension,
+                           sniff_image_format)
 from pageindex.utils import LLMRetriesExhausted
 from server.jobs import JobRunner, JobStore
 
@@ -63,6 +71,17 @@ def _set(env: Mapping[str, str], name: str) -> Optional[str]:
     return value if value else None
 
 
+def _ocr_mode(env: Mapping[str, str]) -> Optional[str]:
+    raw = _set(env, "PAGEINDEX_OCR")
+    if raw is None:
+        return None
+    mode = raw.strip().lower()
+    if mode not in OCR_MODES:
+        raise ValueError(
+            f"PAGEINDEX_OCR must be one of {', '.join(OCR_MODES)}, got {raw!r}")
+    return mode
+
+
 def client_kwargs(env: Mapping[str, str]) -> dict[str, Any]:
     """PageIndexClient constructor kwargs; unset variables are omitted so the
     SDK defaults (and OPENAI_* connection settings) apply."""
@@ -70,9 +89,13 @@ def client_kwargs(env: Mapping[str, str]) -> dict[str, Any]:
         "storage_path": _set(env, "PAGEINDEX_STORAGE_PATH") or DEFAULT_STORAGE_PATH,
     }
     for key, var in (("index_model", "PAGEINDEX_INDEX_MODEL"),
-                     ("chat_model", "PAGEINDEX_CHAT_MODEL")):
+                     ("chat_model", "PAGEINDEX_CHAT_MODEL"),
+                     ("ocr_model", "PAGEINDEX_OCR_MODEL")):
         if _set(env, var):
             kwargs[key] = env[var]
+    ocr = _ocr_mode(env)
+    if ocr is not None:
+        kwargs["ocr"] = ocr
     # index_backend takes LiteLLM's vocabulary (api_base); chat_backend takes
     # the chat surfaces' own (base_url).
     for key, url_key, prefix in (("index_backend", "api_base", "PAGEINDEX_INDEX_"),
@@ -210,11 +233,28 @@ class ChatResponse(BaseModel):
 
 # ---------- app ----------
 
-def _safe_pdf_name(filename: Optional[str]) -> str:
+_UPLOAD_TYPES = ", ".join([".pdf", *sorted(IMAGE_EXTENSIONS)])
+
+
+def _safe_upload_name(filename: Optional[str]) -> str:
+    """The bare file name of a PDF or supported image upload."""
     name = re.split(r"[\\/]", filename or "")[-1].strip()
-    if not name.lower().endswith(".pdf") or name.lower() == ".pdf":
-        raise HTTPException(415, "Only PDF uploads are supported (.pdf).")
+    stem, ext = os.path.splitext(name)
+    if not stem or not (ext.lower() == ".pdf" or has_image_extension(name)):
+        raise HTTPException(
+            415, f"Only PDF or image uploads are supported ({_UPLOAD_TYPES}).")
     return name
+
+
+def _check_upload_content(name: str, path: str) -> None:
+    """The bytes must match the declared kind: a PDF header, or an image
+    Pillow recognizes."""
+    if name.lower().endswith(".pdf"):
+        with open(path, "rb") as check:
+            if not check.read(5).startswith(b"%PDF-"):
+                raise HTTPException(400, "File is not a PDF.")
+    elif sniff_image_format(path) is None:
+        raise HTTPException(400, "File is not a supported image.")
 
 
 class _DeclaredUploadLimit:
@@ -260,6 +300,7 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
     env = dict(os.environ if env is None else env)
     token = _set(env, "PAGEINDEX_API_TOKEN")
     max_upload = _max_upload_bytes(env)
+    _ocr_mode(env)  # fail at startup, like the other settings
     too_large = f"Upload exceeds {max_upload / (1024 * 1024):g} MB."
     workers = _index_workers(env)
     storage = _set(env, "PAGEINDEX_STORAGE_PATH") or DEFAULT_STORAGE_PATH
@@ -348,7 +389,7 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
     @app.post("/documents", status_code=202, dependencies=protected)
     def upload_document(response: Response,
                         file: UploadFile = File(...)) -> dict[str, Any]:
-        name = _safe_pdf_name(file.filename)
+        name = _safe_upload_name(file.filename)
         workdir = tempfile.mkdtemp(prefix="pageindex-upload-")
         try:
             path = os.path.join(workdir, name)
@@ -360,9 +401,7 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
                         raise HTTPException(
                             413, too_large)
                     out.write(chunk)
-            with open(path, "rb") as check:
-                if not check.read(5).startswith(b"%PDF-"):
-                    raise HTTPException(400, "File is not a PDF.")
+            _check_upload_content(name, path)
             try:
                 job = jobs.create(name, path)
             except OSError as exc:
