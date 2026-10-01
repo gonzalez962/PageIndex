@@ -934,3 +934,22 @@ def test_ocr_settings_reach_the_real_client(tmp_path):
                            "PAGEINDEX_OCR": "off",
                            "PAGEINDEX_OCR_MODEL": "openai/gpt-4o"})
     assert (client._api._ocr, client._api._ocr_model) == ("off", "openai/gpt-4o")
+
+
+def test_ocr_image_rejection_fails_job_with_a_hint_and_no_provider_text(make):
+    from pageindex.ocr import OCRModelError
+    fake = FakeClient()
+    cause = FakeUpstreamError("BadRequestError: image_url unsupported, key sk-leaky")
+    ocr_error = OCRModelError(f"The OCR model 'openai/text-model' rejected a page "
+                              f"image; it may not support image input. {cause}")
+    ocr_error.__cause__ = cause
+    err = PageIndexAPIError(f"Failed to submit document: OCR failed: {ocr_error}")
+    err.__cause__ = ocr_error
+    fake.submit_error = err
+    api, _ = make(client=fake, env={"PAGEINDEX_OCR_MODEL": "openai/text-model"})
+    with api:
+        job_id = upload(api, "scan.png", _png_bytes()).json()["job_id"]
+        job = wait_for_status(api, job_id, "failed")
+        assert "sk-leaky" not in api.get(f"/jobs/{job_id}").text
+    assert "may not support image input" in job["error"]
+    assert "PAGEINDEX_OCR" in job["error"]

@@ -44,8 +44,8 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from pageindex import PageIndexAPIError
-from pageindex.ocr import (IMAGE_EXTENSIONS, OCR_MODES, has_image_extension,
-                           sniff_image_format)
+from pageindex.ocr import (IMAGE_EXTENSIONS, OCR_MODES, OCRModelError,
+                           has_image_extension, sniff_image_format)
 from pageindex.utils import LLMRetriesExhausted
 from server.jobs import JobRunner, JobStore
 
@@ -163,6 +163,16 @@ class ClientUnavailable(Exception):
         self.cause_name = type(cause).__name__
 
 
+def _find_in_chain(exc: BaseException, kind: type) -> Optional[BaseException]:
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, kind):
+            return exc
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
 def _is_upstream(exc: BaseException) -> bool:
     seen = set()
     while exc is not None and id(exc) not in seen:
@@ -182,6 +192,13 @@ def _http_error(exc: Exception) -> HTTPException:
         return HTTPException(
             503, f"Model client is not configured ({exc.cause_name}); "
                  "check the server logs.")
+    if _find_in_chain(exc, OCRModelError) is not None:
+        # A fixed hint: the provider's own rejection text is never echoed.
+        logger.error("OCR model rejected a page image")
+        return HTTPException(
+            502, "The OCR model rejected a page image; it may not support "
+                 "image input. Set PAGEINDEX_OCR_MODEL to a vision-capable "
+                 "model, or PAGEINDEX_OCR=off.")
     if _is_upstream(exc):
         root = exc
         while root.__cause__ is not None:
