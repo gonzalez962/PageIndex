@@ -874,14 +874,55 @@ def _png_bytes(fmt="PNG"):
 def test_upload_accepts_images(make, name, fmt):
     api, fake = make()
     data = _png_bytes(fmt)
+    ext = ".png" if name.lower().endswith(".png") else ".jpg"
     with api:
         res = upload(api, name, data)
         assert res.status_code == 202
-        assert res.json()["name"] == name
-        wait_for_status(api, res.json()["job_id"], "done")
+        body = res.json()
+        # Stored under a fresh UUID name; the upload name stays visible.
+        assert re.fullmatch(r"[0-9a-f]{32}" + re.escape(ext), body["name"])
+        assert body["original_name"] == name
+        job = wait_for_status(api, body["job_id"], "done")
+    assert job["name"] == body["name"] and job["original_name"] == name
     path, submitted = fake.submitted[0]
-    assert os.path.basename(path) == name
+    assert os.path.basename(path) == body["name"]
     assert submitted == data
+    assert fake.metadata[0] == {"job_id": body["job_id"], "original_name": name}
+
+
+class UniqueNameClient(FakeClient):
+    """Refuses a document whose file name is already indexed, like a store
+    that keys documents by name."""
+
+    def submit_document(self, file_path, metadata=None):
+        name = os.path.basename(file_path)
+        if any(os.path.basename(path) == name for path, _ in self.submitted):
+            raise PageIndexAPIError(f"Failed to submit document: {name} exists.")
+        return super().submit_document(file_path, metadata)
+
+
+def test_repeated_image_uploads_never_share_a_stored_name(make):
+    api, fake = make(client=UniqueNameClient())
+    with api:
+        bodies = [upload(api, "scan.png", _png_bytes()).json() for _ in range(2)]
+        jobs = [wait_for_status(api, body["job_id"], "done") for body in bodies]
+    names = [body["name"] for body in bodies]
+    assert names[0] != names[1]
+    assert [job["original_name"] for job in jobs] == ["scan.png", "scan.png"]
+    stored = [os.path.basename(path) for path, _ in fake.submitted]
+    assert sorted(stored) == sorted(names)
+    assert [meta["original_name"] for meta in fake.metadata] == ["scan.png"] * 2
+
+
+def test_pdf_uploads_keep_their_name(make):
+    api, fake = make()
+    with api:
+        body = upload(api, "My Report.pdf").json()
+        job = wait_for_status(api, body["job_id"], "done")
+    assert body["name"] == job["name"] == "My Report.pdf"
+    assert "original_name" not in body and "original_name" not in job
+    assert os.path.basename(fake.submitted[0][0]) == "My Report.pdf"
+    assert fake.metadata[0] == {"job_id": body["job_id"]}
 
 
 def test_upload_rejects_disguised_image(make):

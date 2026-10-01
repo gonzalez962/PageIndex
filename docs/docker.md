@@ -95,6 +95,18 @@ the kind and the content must match it: a PDF header, or a PNG or JPEG
 image. Only the first frame is read, so an animated PNG is one page.
 Scanned pages and images are read by OCR; see [OCR](#ocr).
 
+An uploaded image is stored, and indexed, under a fresh UUID name
+(`<32 hex digits>.png` or `.jpg`), so uploading `scan.png` twice never
+collides. The name you uploaded is kept as `original_name` in the upload
+response, the job, and the document's `metadata`:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" -F file=@scan.png   http://127.0.0.1:8000/documents
+# {"job_id":"job-7c1e...","status":"queued","name":"5b0e...c4.png","original_name":"scan.png"}
+```
+
+PDF uploads keep their file name and have no `original_name`.
+
 `GET /jobs` lists jobs newest first (`status`, `limit`, `offset` filters), and
 `/health` reports `"queue": {"queued": n, "processing": n}`.
 

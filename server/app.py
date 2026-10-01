@@ -34,6 +34,7 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Literal, Mapping, Optional, Union
 
@@ -263,6 +264,15 @@ def _safe_upload_name(filename: Optional[str]) -> str:
     return name
 
 
+def _stored_name(name: str) -> str:
+    """The on-disk name of an upload: PDFs keep theirs; images get a fresh
+    UUID name, so repeated uploads of one scan never collide as documents."""
+    ext = os.path.splitext(name)[1].lower()
+    if ext == ".pdf":
+        return name
+    return uuid.uuid4().hex + (".png" if ext == ".png" else ".jpg")
+
+
 def _check_upload_content(name: str, path: str) -> None:
     """The bytes must match the declared kind: a PDF header, or an image
     Pillow recognizes."""
@@ -419,8 +429,10 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
                             413, too_large)
                     out.write(chunk)
             _check_upload_content(name, path)
+            stored = _stored_name(name)
             try:
-                job = jobs.create(name, path)
+                job = jobs.create(stored, path,
+                                  original_name=None if stored == name else name)
             except OSError as exc:
                 logger.exception("Could not store upload as a job")
                 raise HTTPException(
@@ -429,7 +441,10 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
             shutil.rmtree(workdir, ignore_errors=True)
         runner.enqueue(job["id"])
         response.headers["Location"] = f"/jobs/{job['id']}"
-        return {"job_id": job["id"], "status": job["status"], "name": name}
+        body = {"job_id": job["id"], "status": job["status"], "name": job["name"]}
+        if "original_name" in job:
+            body["original_name"] = job["original_name"]
+        return body
 
     @app.get("/jobs", dependencies=protected)
     def list_jobs(status: Optional[Literal["queued", "processing", "done", "failed"]] = None,
