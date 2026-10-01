@@ -19,11 +19,11 @@ from io import BytesIO
 OCR_MODES = ("off", "auto", "force")
 DEFAULT_OCR_MODE = "auto"
 
-# Image files are converted to a scanned PDF; Pillow sniffs the content, the
-# extension alone never decides. MPO is how Pillow reports some camera JPEGs.
-IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".tif",
-                              ".tiff", ".bmp", ".gif"})
-_IMAGE_FORMATS = frozenset({"PNG", "JPEG", "MPO", "WEBP", "TIFF", "BMP", "GIF"})
+# PNG and JPEG files are converted to a one-page scanned PDF; Pillow sniffs
+# the content, the extension alone never decides. MPO is how Pillow reports
+# some camera JPEGs.
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg"})
+_IMAGE_FORMATS = frozenset({"PNG", "JPEG", "MPO"})
 
 # A page with fewer non-whitespace characters than this has no usable text
 # layer (blank, a page number, stray scanner noise) and is transcribed.
@@ -125,18 +125,18 @@ def _image_dpi(image) -> float:
 
 
 def image_to_pdf(src_path, out_path) -> int:
-    """Write the image at src_path as a PDF without a text layer, one page
-    per frame (multi-page TIFF, animated GIF). Returns the page count."""
-    from PIL import Image, ImageOps, ImageSequence
+    """Write the image at src_path as a one-page PDF without a text layer.
+    Only the first frame is used (an animated PNG or a multi-picture JPEG
+    is still one page, one vision call). Returns the page count."""
+    from PIL import Image, ImageOps
     if sniff_image_format(src_path) is None:
         raise ValueError(f"{os.path.basename(str(src_path))} is not a supported image.")
     with Image.open(src_path) as image:
+        # Image.open leaves the first frame selected; copy() decodes only it.
         dpi = _image_dpi(image)
-        frames = [_to_rgb(ImageOps.exif_transpose(frame.copy()))
-                  for frame in ImageSequence.Iterator(image)]
-    frames[0].save(out_path, "PDF", save_all=True, append_images=frames[1:],
-                   resolution=dpi)
-    return len(frames)
+        page = _to_rgb(ImageOps.exif_transpose(image.copy()))
+    page.save(out_path, "PDF", resolution=dpi)
+    return 1
 
 
 # ── page analysis ──

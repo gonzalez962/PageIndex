@@ -126,9 +126,8 @@ class LocalAPI:
         is_image = has_image_extension(doc_name)
         if not (doc_name.lower().endswith(".pdf") or is_image):
             raise PageIndexAPIError(
-                "Failed to submit document: only PDF files and images (png, "
-                "jpg, jpeg, webp, tif, tiff, bmp, gif) are supported in local "
-                "mode."
+                "Failed to submit document: only PDF files and PNG or JPEG "
+                "images (png, jpg, jpeg) are supported in local mode."
             )
         if is_image and self._ocr == "off":
             raise PageIndexAPIError(

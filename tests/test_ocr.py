@@ -225,13 +225,30 @@ def _image_bytes(fmt, size=(64, 48), mode="RGB", frames=1):
 
 
 @pytest.mark.parametrize("name,fmt", [
-    ("a.png", "PNG"), ("a.jpg", "JPEG"), ("a.jpeg", "JPEG"), ("a.webp", "WEBP"),
-    ("a.tif", "TIFF"), ("a.tiff", "TIFF"), ("a.bmp", "BMP"), ("a.GIF", "GIF"),
+    ("a.png", "PNG"), ("a.jpg", "JPEG"), ("a.jpeg", "JPEG"), ("a.PNG", "PNG"),
+    ("a.JPG", "JPEG"),
 ])
 def test_supported_images_are_detected_by_content(tmp_path, name, fmt):
     path = _write(tmp_path, name, _image_bytes(fmt))
     assert ocr.has_image_extension(name)
     assert ocr.is_image_path(path)
+
+
+@pytest.mark.parametrize("ext,fmt", [
+    ("webp", "WEBP"), ("tif", "TIFF"), ("tiff", "TIFF"), ("bmp", "BMP"),
+    ("gif", "GIF"),
+])
+def test_only_png_and_jpeg_are_supported(tmp_path, ext, fmt):
+    data = _image_bytes(fmt)
+    native = _write(tmp_path, f"a.{ext}", data)
+    assert not ocr.has_image_extension(native)
+    assert not ocr.is_image_path(native)
+    # The content decides too: another format behind a .png name is refused.
+    disguised = _write(tmp_path, "b.png", data)
+    assert ocr.sniff_image_format(data) is None
+    assert not ocr.is_image_path(disguised)
+    with pytest.raises(ValueError, match="not a supported image"):
+        ocr.image_to_pdf(disguised, str(tmp_path / "out.pdf"))
 
 
 def test_disguised_or_unsupported_files_are_not_images(tmp_path):
@@ -251,7 +268,7 @@ def test_sniff_image_format_reads_bytes():
 
 
 @pytest.mark.parametrize("fmt,mode", [("PNG", "RGBA"), ("JPEG", "L"),
-                                       ("GIF", "P"), ("PNG", "LA")])
+                                       ("PNG", "P"), ("PNG", "LA")])
 def test_image_to_pdf_produces_one_scanned_page(tmp_path, fmt, mode):
     import pypdfium2 as pdfium
     src = _write(tmp_path, f"img.{fmt.lower()}", _image_bytes(fmt, mode=mode))
@@ -265,10 +282,31 @@ def test_image_to_pdf_produces_one_scanned_page(tmp_path, fmt, mode):
         doc.close()
 
 
-def test_multi_frame_tiff_becomes_one_page_per_frame(tmp_path):
-    src = _write(tmp_path, "scan.tiff", _image_bytes("TIFF", frames=3))
+def _apng_bytes(colors=("red", "green", "blue"), size=(200, 260)):
+    frames = [Image.new("RGB", size, color) for color in colors]
+    buf = io.BytesIO()
+    frames[0].save(buf, "PNG", save_all=True, append_images=frames[1:])
+    return buf.getvalue()
+
+
+def test_animated_png_uses_only_its_first_frame(tmp_path, vision):
+    import pypdfium2 as pdfium
+    data = _apng_bytes()
+    with Image.open(io.BytesIO(data)) as image:
+        assert getattr(image, "n_frames", 1) == 3  # really animated
+    src = _write(tmp_path, "anim.png", data)
     out = str(tmp_path / "out.pdf")
-    assert ocr.image_to_pdf(src, out) == 3
+    assert ocr.image_to_pdf(src, out) == 1
+    doc = pdfium.PdfDocument(out)
+    try:
+        assert len(doc) == 1
+        pixel = doc[0].render(scale=0.5).to_pil().convert("RGB").getpixel((10, 10))
+    finally:
+        doc.close()
+    assert pixel[0] > 200 and pixel[1] < 60 and pixel[2] < 60  # the red frame
+    result = ocr.ocr_pages(out, [""], model="gpt-4o", mode="auto")
+    assert result.page_texts == ["Transcribed text"]
+    assert len(vision.calls) == 1
 
 
 def test_image_to_pdf_rejects_non_images(tmp_path):

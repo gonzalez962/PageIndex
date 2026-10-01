@@ -80,10 +80,21 @@ def test_png_is_indexed_through_ocr(cli, tmp_path):
     assert out["doc_name"] == "scan.png"
 
 
-def test_multi_frame_tiff_yields_one_page_per_frame(cli, tmp_path):
-    seen = cli("--pdf_path", _image(tmp_path, "pages.tif", "TIFF", frames=2))
-    assert len(seen["standard"]["page_list"]) == 2
-    assert len(seen["vision"]) == 2
+def test_animated_png_yields_only_its_first_frame(cli, tmp_path):
+    seen = cli("--pdf_path", _image(tmp_path, "anim.png", "PNG", frames=3))
+    assert len(seen["standard"]["page_list"]) == 1
+    assert len(seen["vision"]) == 1
+
+
+@pytest.mark.parametrize("ext,fmt", [("webp", "WEBP"), ("tif", "TIFF"),
+                                     ("tiff", "TIFF"), ("bmp", "BMP"),
+                                     ("gif", "GIF")])
+def test_images_other_than_png_and_jpeg_are_rejected(cli, tmp_path, ext, fmt):
+    with pytest.raises(ValueError, match=r"must be a PDF \(\.pdf\) or a PNG or JPEG"):
+        cli("--pdf_path", _image(tmp_path, f"pic.{ext}", fmt))
+    # Their content behind a .png name is refused as well.
+    with pytest.raises(ValueError, match="not a supported image"):
+        cli("--pdf_path", _image(tmp_path, f"pic-{ext}.png", fmt))
 
 
 def test_ocr_model_flag_picks_the_vision_model(cli, tmp_path):

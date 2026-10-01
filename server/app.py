@@ -15,8 +15,8 @@ Configuration comes from the environment (see .env.example):
   model's vision input for scanned pages, figures and image uploads.
 - PAGEINDEX_OCR_MODEL: vision model for OCR (default: the index model).
 
-Uploads are PDFs or images (png, jpg, jpeg, webp, tif, tiff, bmp, gif),
-checked by extension and by content.
+Uploads are PDFs or PNG/JPEG images (png, jpg, jpeg), checked by
+extension and by content.
 
 Uploads are queued as jobs under ``<storage>/jobs`` and indexed in the
 background (see server/jobs.py); poll ``GET /jobs/{job_id}`` for the result.
@@ -254,12 +254,12 @@ _UPLOAD_TYPES = ", ".join([".pdf", *sorted(IMAGE_EXTENSIONS)])
 
 
 def _safe_upload_name(filename: Optional[str]) -> str:
-    """The bare file name of a PDF or supported image upload."""
+    """The bare file name of a PDF, PNG or JPEG upload."""
     name = re.split(r"[\\/]", filename or "")[-1].strip()
     stem, ext = os.path.splitext(name)
     if not stem or not (ext.lower() == ".pdf" or has_image_extension(name)):
         raise HTTPException(
-            415, f"Only PDF or image uploads are supported ({_UPLOAD_TYPES}).")
+            415, f"Only PDF, PNG or JPEG uploads are supported ({_UPLOAD_TYPES}).")
     return name
 
 

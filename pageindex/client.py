@@ -455,7 +455,7 @@ class PageIndexClient:
     construction instead of inferring it from api_key.
 
     Local mode differences (all documented per method): indexing is
-    synchronous, PDFs and images (png, jpg, webp, tiff, bmp, gif) are
+    synchronous, PDFs and PNG/JPEG images (png, jpg, jpeg) are
     supported, and folders / ``beta_headers`` /
     the deprecated retrieval API (``submit_query``, ``get_retrieval``) are
     cloud-only.
@@ -782,8 +782,8 @@ class PageIndexClient:
 
         Args:
             file_path (str): Path to the PDF file — locally also an image
-                (png, jpg, jpeg, webp, tif, tiff, bmp, gif), indexed
-                through OCR.
+                (png, jpg, jpeg; only the first frame of an animated
+                PNG), indexed through OCR.
             mode (str, optional): Processing mode. Local defaults to "flash";
                 pass "standard" for a full LLM-built tree. Cloud modes are
                 passed through (e.g. "mcp").

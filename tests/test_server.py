@@ -870,7 +870,7 @@ def _png_bytes(fmt="PNG"):
 
 
 @pytest.mark.parametrize("name,fmt", [("scan.png", "PNG"), ("photo.JPG", "JPEG"),
-                                      ("page.tiff", "TIFF"), ("pic.webp", "WEBP")])
+                                      ("photo.jpeg", "JPEG")])
 def test_upload_accepts_images(make, name, fmt):
     api, fake = make()
     data = _png_bytes(fmt)
@@ -899,8 +899,25 @@ def test_upload_rejects_unsupported_types(make):
     for name in ("notes.txt", "icon.ico", "scan.svg", ".png"):
         res = upload(api, name, _png_bytes())
         assert res.status_code == 415
-        assert "PDF or image" in res.json()["detail"]
+        assert "PDF, PNG or JPEG" in res.json()["detail"]
     assert fake.submitted == []
+
+
+@pytest.mark.parametrize("ext,fmt", [("webp", "WEBP"), ("tif", "TIFF"),
+                                     ("tiff", "TIFF"), ("bmp", "BMP"),
+                                     ("gif", "GIF")])
+def test_upload_accepts_only_png_and_jpeg_images(make, ext, fmt):
+    api, fake = make()
+    data = _png_bytes(fmt)
+    res = upload(api, f"pic.{ext}", data)
+    assert res.status_code == 415
+    assert "(.pdf, .jpeg, .jpg, .png)" in res.json()["detail"]
+    # Their content behind a .png name is not a supported image either.
+    res = upload(api, "pic.png", data)
+    assert res.status_code == 400
+    assert "not a supported image" in res.json()["detail"]
+    assert fake.submitted == []
+    assert api.get("/jobs").json()["total"] == 0
 
 
 def test_image_upload_keeps_the_size_limit(make):

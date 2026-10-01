@@ -814,7 +814,7 @@ def test_submit_rejections(local_client, sample_pdf, tmp_path):
     with pytest.raises(FileNotFoundError):
         local_client.submit_document(str(tmp_path / "missing.pdf"))
     (tmp_path / "notes.txt").write_text("hi")
-    with pytest.raises(PageIndexAPIError, match="only PDF files and images"):
+    with pytest.raises(PageIndexAPIError, match="only PDF files and PNG or JPEG"):
         local_client.submit_document(str(tmp_path / "notes.txt"))
     with pytest.raises(PageIndexAPIError, match="unknown local processing mode"):
         local_client.submit_document(sample_pdf, mode="mcp")
@@ -3446,19 +3446,38 @@ def test_image_rich_page_stores_text_and_figure_description(
 
 
 @pytest.mark.parametrize("name,fmt,frames", [
-    ("scan.png", "PNG", 1), ("photo.jpg", "JPEG", 1), ("pages.tiff", "TIFF", 3)])
+    ("scan.png", "PNG", 1), ("photo.jpg", "JPEG", 1), ("photo.jpeg", "JPEG", 1),
+    # An animated PNG is read as its first frame only: one page, one call.
+    ("anim.png", "PNG", 3)])
 def test_image_files_are_indexed(local_client, tmp_path, monkeypatch, name, fmt, frames):
     calls = _vision_mock(monkeypatch)
     runs = _stub_pipelines(monkeypatch)
     result = local_client.submit_document(_image_file(tmp_path, name, fmt, frames))
     assert result["name"] == name
-    assert len(calls) == frames
+    assert len(calls) == 1
     assert "flash" not in runs
     # The converted PDF is a temporary file, gone after the submit.
     assert runs["standard"]["exists"]
     assert not os.path.exists(runs["standard"]["doc"])
     meta = local_client._api._store.get_meta(result["doc_id"])
-    assert meta["pageNum"] == frames and meta["mode"] == "standard"
+    assert meta["pageNum"] == 1 and meta["mode"] == "standard"
+
+
+@pytest.mark.parametrize("ext,fmt", [
+    ("webp", "WEBP"), ("tif", "TIFF"), ("tiff", "TIFF"), ("bmp", "BMP"),
+    ("gif", "GIF")])
+def test_images_other_than_png_and_jpeg_are_rejected(
+        local_client, tmp_path, monkeypatch, ext, fmt):
+    calls = _vision_mock(monkeypatch)
+    _stub_pipelines(monkeypatch)
+    with pytest.raises(PageIndexAPIError, match=r"only PDF files and PNG or JPEG"):
+        local_client.submit_document(_image_file(tmp_path, f"pic.{ext}", fmt))
+    # Their content behind a .png name is refused as well.
+    disguised = _image_file(tmp_path, f"pic-{ext}.png", fmt)
+    with pytest.raises(PageIndexAPIError, match="could not read image"):
+        local_client.submit_document(disguised)
+    assert calls == []
+    assert local_client.list_documents()["total"] == 0
 
 
 def test_disguised_image_is_rejected(local_client, tmp_path, monkeypatch):

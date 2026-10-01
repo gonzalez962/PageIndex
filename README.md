@@ -103,7 +103,7 @@ print(answer)
 
 ### Scanned PDFs, figures and images
 
-Local mode reads text-based PDFs, scanned PDFs (no text layer), image-rich PDFs and image files (`png`, `jpg`, `jpeg`, `webp`, `tif`, `tiff`, `bmp`, `gif`). Pages without a usable text layer are transcribed by your index model through its vision input, so **that model must accept images** (or set a separate `ocr_model=`).
+Local mode reads text-based PDFs, scanned PDFs (no text layer), image-rich PDFs and PNG or JPEG image files (`png`, `jpg`, `jpeg`; other image formats are refused). Only the first frame of an image is read, so an animated PNG is one page. Pages without a usable text layer are transcribed by your index model through its vision input, so **that model must accept images** (or set a separate `ocr_model=`).
 
 ```python
 client = PageIndexClient(
@@ -123,7 +123,7 @@ doc_id = client.submit_document("scan.png")["doc_id"]
 
 - **Cost:** one vision call per OCR'd or described page.
 - **Pipeline:** a document whose text came from OCR (including every image file) is indexed in standard mode, since flash reads the PDF text layer only. `get_ocr()` returns the transcribed or figure-augmented page text.
-- **CLI:** `python run_pageindex.py --pdf_path scan.png --ocr auto --ocr-model <vision-model>`; `--pdf_path` accepts the same image types.
+- **CLI:** `python run_pageindex.py --pdf_path scan.png --ocr auto --ocr-model <vision-model>`; `--pdf_path` accepts the same PNG and JPEG files.
 - If the provider rejects image input, indexing fails once with an error saying the OCR model may not support images.
 
 ### [Use PageIndex through the SDK client →](https://docs.pageindex.ai/getting-started)

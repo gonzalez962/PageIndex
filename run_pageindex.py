@@ -39,7 +39,7 @@ if __name__ == "__main__":
     # Set up argument parser
     parser = argparse.ArgumentParser(description='Process PDF or Markdown document and generate structure')
     parser.add_argument('--pdf_path', type=str,
-                      help=f'Path to the PDF file, or an image ({IMAGE_TYPES}) indexed through OCR')
+                      help=f'Path to the PDF file, or a PNG/JPEG image ({IMAGE_TYPES}) indexed through OCR')
     parser.add_argument('--md_path', type=str, help='Path to the Markdown file')
     parser.add_argument('--mode', choices=['flash', 'standard'], default='flash',
                       help='Processing mode (default: flash)')
@@ -134,7 +134,7 @@ if __name__ == "__main__":
         # Validate the document: a PDF, or an image converted to one
         is_image = has_image_extension(args.pdf_path)
         if not (args.pdf_path.lower().endswith('.pdf') or is_image):
-            raise ValueError(f"Document must be a PDF (.pdf) or an image ({IMAGE_TYPES})")
+            raise ValueError(f"Document must be a PDF (.pdf) or a PNG or JPEG image ({IMAGE_TYPES})")
         if not os.path.isfile(args.pdf_path):
             raise ValueError(f"File not found: {args.pdf_path}")
         if is_image and args.ocr == 'off':

@@ -89,9 +89,10 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:8000/jobs/job-3f2a.../retry
 ```
 
-Images (`png`, `jpg`, `jpeg`, `webp`, `tif`, `tiff`, `bmp`, `gif`) upload
-the same way (`-F file=@scan.png`). The extension picks the kind and the
-content must match it: a PDF header, or an image the server can decode.
+PNG and JPEG images (`png`, `jpg`, `jpeg`) upload the same way
+(`-F file=@scan.png`); other image formats are refused. The extension picks
+the kind and the content must match it: a PDF header, or a PNG or JPEG
+image. Only the first frame is read, so an animated PNG is one page.
 Scanned pages and images are read by OCR; see [OCR](#ocr).
 
 `GET /jobs` lists jobs newest first (`status`, `limit`, `offset` filters), and
@@ -100,12 +101,12 @@ Scanned pages and images are read by OCR; see [OCR](#ocr).
 | Status | Meaning |
 |--------|---------|
 | 202 | Upload or retry accepted; follow the `Location` header to the job |
-| 400 | Content that is not a PDF or a supported image, an invalid `Content-Length`, or the SDK rejected the input |
+| 400 | Content that is not a PDF, PNG or JPEG, an invalid `Content-Length`, or the SDK rejected the input |
 | 401 | Missing or wrong bearer token |
 | 404 | Unknown document or job |
 | 409 | Retry of a job that is queued, running, or already done |
 | 413 | Upload over `PAGEINDEX_MAX_UPLOAD_MB`; a declared `Content-Length` over the limit is refused before the body is read |
-| 415 | Not a `.pdf` or supported image file |
+| 415 | Not a `.pdf`, `.png`, `.jpg` or `.jpeg` file |
 | 502 | The model provider failed (model name, base URL, or key); a `NotFoundError` adds a hint about the `openai/` prefix, and an OCR image rejection says the model may not support image input |
 | 503 | The model client cannot be built (check the logs), or the upload could not be stored (retry later) |
 
@@ -177,7 +178,7 @@ Chat, listing, and `/health` stay responsive while documents are indexed.
 
 ## CLI indexer
 
-Put PDFs or images in `./data`; tree structures are written to `./results`.
+Put PDFs or PNG/JPEG images in `./data`; tree structures are written to `./results`.
 
 ```bash
 docker compose --profile cli run --rm cli --pdf_path data/report.pdf
