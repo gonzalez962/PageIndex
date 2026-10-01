@@ -144,14 +144,19 @@ if __name__ == "__main__":
             'index_model': args.index_model,
             'model': args.model,
         }.items() if v is not None}).model
-        scratch = tempfile.TemporaryDirectory(prefix='pageindex-')
         pdf_file = args.pdf_path
+        # A converted image is only read by OCR: an image always gets a
+        # page_list and so the standard pipeline, which reads that list (and
+        # never this scratch PDF). The directory goes away even when OCR fails.
+        with tempfile.TemporaryDirectory(prefix='pageindex-') as scratch:
+            if is_image:
+                pdf_file = os.path.join(scratch, 'document.pdf')
+                image_to_pdf(args.pdf_path, pdf_file)
+            page_list = ocr_page_list(pdf_file, args.ocr, args.ocr_model or index_model,
+                                      flash=args.mode == 'flash' and not is_image,
+                                      always=is_image)
         if is_image:
-            pdf_file = os.path.join(scratch.name, 'document.pdf')
-            image_to_pdf(args.pdf_path, pdf_file)
-        page_list = ocr_page_list(pdf_file, args.ocr, args.ocr_model or index_model,
-                                  flash=args.mode == 'flash' and not is_image,
-                                  always=is_image)
+            pdf_file = args.pdf_path
         if args.mode == 'flash' and page_list is not None:
             # Flash reads the PDF text layer and cannot see OCR'd text.
             print('Document needed OCR; indexing it in standard mode.')
@@ -203,7 +208,6 @@ if __name__ == "__main__":
             }
             opt = ConfigLoader().load({k: v for k, v in user_opt.items() if v is not None})
             toc_with_page_number = page_index_main(args.pdf_path, opt, page_list=page_list)
-        scratch.cleanup()
 
         print('Parsing done, saving to file...')
 

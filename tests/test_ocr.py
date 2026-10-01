@@ -262,6 +262,25 @@ def test_disguised_or_unsupported_files_are_not_images(tmp_path):
     assert not ocr.is_image_path(other)
 
 
+def test_decompression_bombs_are_not_images(tmp_path, monkeypatch):
+    import warnings
+    data = _image_bytes("PNG", size=(64, 48))  # 3072 pixels
+    path = _write(tmp_path, "bomb.png", data)
+    # Over twice the limit Pillow raises DecompressionBombError.
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+    assert ocr.sniff_image_format(data) is None
+    assert not ocr.is_image_path(path)
+    with pytest.raises(ValueError, match="not a supported image"):
+        ocr.image_to_pdf(path, str(tmp_path / "out.pdf"))
+    # Just over the limit it warns; a warning promoted to an error is a
+    # rejection too, never an unhandled exception.
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 2000)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        assert ocr.sniff_image_format(data) is None
+        assert not ocr.is_image_path(path)
+
+
 def test_sniff_image_format_reads_bytes():
     assert ocr.sniff_image_format(_image_bytes("PNG")) == "PNG"
     assert ocr.sniff_image_format(b"%PDF-1.4") is None

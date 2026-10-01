@@ -88,13 +88,16 @@ def has_image_extension(name) -> bool:
 
 def sniff_image_format(source) -> str | None:
     """Pillow's format name for a supported image (path or bytes), else
-    None. Only the header is parsed; pixels are not decoded."""
+    None. Only the header is parsed; pixels are not decoded. A header
+    declaring more pixels than Pillow's decompression-bomb limit is not a
+    supported image either (also when its warning is promoted to an error)."""
     from PIL import Image, UnidentifiedImageError
     try:
         handle = BytesIO(source) if isinstance(source, (bytes, bytearray)) else source
         with Image.open(handle) as image:
             fmt = image.format
-    except (UnidentifiedImageError, OSError, ValueError):
+    except (UnidentifiedImageError, OSError, ValueError,
+            Image.DecompressionBombError, Image.DecompressionBombWarning):
         return None
     return fmt if fmt in _IMAGE_FORMATS else None
 

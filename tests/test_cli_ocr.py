@@ -97,6 +97,28 @@ def test_images_other_than_png_and_jpeg_are_rejected(cli, tmp_path, ext, fmt):
         cli("--pdf_path", _image(tmp_path, f"pic-{ext}.png", fmt))
 
 
+@pytest.mark.parametrize("failing", ["vision", "indexer"])
+def test_scratch_dir_is_removed_when_indexing_fails(cli, tmp_path, monkeypatch, failing):
+    import tempfile
+    scratch_root = tmp_path / "tmp"
+    scratch_root.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch_root))
+
+    async def broken_vision(model, prompt):
+        raise RuntimeError("vision down")
+
+    def broken_main(*args, **kwargs):
+        raise RuntimeError("indexer down")
+    if failing == "vision":
+        monkeypatch.setattr(pageindex.utils, "llm_acompletion", broken_vision)
+    else:
+        monkeypatch.setattr(pageindex.page_index_classic, "page_index_main", broken_main)
+        monkeypatch.setattr(pageindex, "page_index_main", broken_main, raising=False)
+    with pytest.raises(RuntimeError, match="down"):
+        cli("--pdf_path", _image(tmp_path, "scan.png", "PNG"))
+    assert list(scratch_root.iterdir()) == []
+
+
 def test_ocr_model_flag_picks_the_vision_model(cli, tmp_path):
     seen = cli("--pdf_path", _image(tmp_path, "scan.jpg", "JPEG"),
                "--index-model", "openai/gpt-4o-mini", "--ocr-model", "openai/gpt-4o")

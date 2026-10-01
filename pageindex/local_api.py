@@ -135,6 +135,10 @@ class LocalAPI:
                 "client disables (ocr='off'). Use ocr='auto' or 'force'."
             )
 
+        # Fail a taken name before any vision call is paid for; the final
+        # check-then-write below still runs under the store lock.
+        self._unique_doc_name(doc_name)
+
         # A converted image lives only for this submit.
         with tempfile.TemporaryDirectory(prefix="pageindex-") as scratch:
             pdf_path = file_path
@@ -207,7 +211,6 @@ class LocalAPI:
         if mode == "flash" and needs_text_pipeline:
             logger.info("Document needed OCR; indexing it in standard mode.")
             mode = "standard"
-        self._unique_doc_name(doc_name)
         try:
             if mode == "flash":
                 structure, description = run_off_loop(

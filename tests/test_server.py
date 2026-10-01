@@ -935,6 +935,17 @@ def test_upload_rejects_disguised_image(make):
     assert api.get("/jobs").json()["total"] == 0
 
 
+def test_upload_rejects_decompression_bombs_with_400(make, monkeypatch):
+    from PIL import Image
+    api, fake = make()
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)  # _png_bytes: 1200 px
+    res = upload(api, "huge.png", _png_bytes())
+    assert res.status_code == 400
+    assert "not a supported image" in res.json()["detail"]
+    assert fake.submitted == []
+    assert api.get("/jobs").json()["total"] == 0
+
+
 def test_upload_rejects_unsupported_types(make):
     api, fake = make()
     for name in ("notes.txt", "icon.ico", "scan.svg", ".png"):

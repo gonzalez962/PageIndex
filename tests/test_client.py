@@ -3480,6 +3480,22 @@ def test_images_other_than_png_and_jpeg_are_rejected(
     assert local_client.list_documents()["total"] == 0
 
 
+def test_taken_name_is_rejected_before_any_vision_call(local_client, tmp_path, monkeypatch):
+    calls = _vision_mock(monkeypatch)
+    runs = _stub_pipelines(monkeypatch)
+    taken = [{"name": "scanned.pdf"}] + [{"name": f"scanned_{n}.pdf"} for n in range(1, 100)]
+    monkeypatch.setattr(local_client._api._store, "list_metas", lambda: taken)
+    with pytest.raises(PageIndexAPIError, match="Too many files with similar names"):
+        local_client.submit_document(_scanned_pdf_file(tmp_path))
+    assert calls == [] and runs == {}
+
+
+def test_local_index_config_declares_every_local_index_key():
+    from pageindex import LocalIndexConfig
+    from pageindex.client import _LOCAL_INDEX_KEYS
+    assert set(_LOCAL_INDEX_KEYS) <= set(LocalIndexConfig.__annotations__)
+
+
 def test_disguised_image_is_rejected(local_client, tmp_path, monkeypatch):
     calls = _vision_mock(monkeypatch)
     _stub_pipelines(monkeypatch)
