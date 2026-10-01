@@ -65,5 +65,28 @@ class ProcessTocNoPageNumbersTest(unittest.TestCase):
         self.assertIn("<physical_index_1>", wrapped)
 
 
+class PageIndexMainInputTest(unittest.TestCase):
+    def test_page_list_allows_a_non_pdf_document_name(self):
+        from pageindex.page_index_classic import page_index_main
+        from pageindex.utils import ConfigLoader
+
+        async def fake_tree_parser(page_list, opt, doc=None, logger=None):
+            return [{"title": "T", "start_index": 1, "end_index": 1}]
+
+        opt = ConfigLoader().load({"if_add_node_summary": "no",
+                                   "if_add_node_text": "no",
+                                   "if_add_doc_description": "no"})
+        with patch("pageindex.page_index_classic.tree_parser", fake_tree_parser):
+            result = page_index_main("scan.png", opt, logger=Mock(),
+                                     page_list=[("OCR text", 2)])
+        self.assertEqual(result["doc_name"], "scan.png")
+        self.assertEqual(result["structure"][0]["title"], "T")
+
+    def test_non_pdf_without_page_list_is_still_rejected(self):
+        from pageindex.page_index_classic import page_index_main
+        with self.assertRaises(ValueError):
+            page_index_main("scan.png", Mock(), logger=Mock())
+
+
 if __name__ == "__main__":
     unittest.main()
