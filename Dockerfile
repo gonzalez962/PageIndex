@@ -19,7 +19,10 @@ COPY server ./server
 # root-owned on Linux hosts; see docs/docker.md. The HTTP API (compose
 # service "api") overrides this entrypoint with uvicorn.
 
-# PAGEINDEX_INDEX_MODEL (optional) becomes --index-model; every other argument
+# PAGEINDEX_INDEX_MODEL (optional) becomes --index-model. For --pdf_path runs,
+# PAGEINDEX_OCR / PAGEINDEX_OCR_MODEL (optional) become --ocr / --ocr-model,
+# placed before the given arguments so explicit flags win; other runs (e.g.
+# --md_path, which refuses OCR flags) never get them. Every other argument
 # passes through to run_pageindex.py unchanged.
-ENTRYPOINT ["sh", "-c", "exec python run_pageindex.py ${PAGEINDEX_INDEX_MODEL:+--index-model \"$PAGEINDEX_INDEX_MODEL\"} \"$@\"", "--"]
+ENTRYPOINT ["sh", "-c", "case \" $* \" in *\" --pdf_path\"*) set -- ${PAGEINDEX_OCR:+--ocr \"$PAGEINDEX_OCR\"} ${PAGEINDEX_OCR_MODEL:+--ocr-model \"$PAGEINDEX_OCR_MODEL\"} \"$@\";; esac; exec python run_pageindex.py ${PAGEINDEX_INDEX_MODEL:+--index-model \"$PAGEINDEX_INDEX_MODEL\"} \"$@\"", "--"]
 CMD ["--help"]

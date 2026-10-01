@@ -137,8 +137,8 @@ All settings live in `.env`; see `.env.example` for the annotated list.
 | `PAGEINDEX_PORT` | `8000` | Host port, bound on `127.0.0.1` only |
 | `PAGEINDEX_MAX_UPLOAD_MB` | `50` | Upload size limit; a finite number > 0 that is at least 1 byte (e.g. `0.5`) |
 | `PAGEINDEX_INDEX_WORKERS` | `1` | Documents indexed in parallel; an integer >= 1 |
-| `PAGEINDEX_OCR` | `auto` | OCR mode: `off`, `auto` or `force` (API) |
-| `PAGEINDEX_OCR_MODEL` | index model | Vision model for OCR (API); uses the indexing provider |
+| `PAGEINDEX_OCR` | `auto` | OCR mode: `off`, `auto` or `force` (API and CLI) |
+| `PAGEINDEX_OCR_MODEL` | index model | Vision model for OCR (API and CLI); uses the indexing provider |
 
 An invalid `PAGEINDEX_MAX_UPLOAD_MB`, `PAGEINDEX_INDEX_WORKERS` or
 `PAGEINDEX_OCR` stops the API at startup with a message naming the variable.
@@ -198,8 +198,11 @@ docker compose --profile cli run --rm cli --help
 ```
 
 `PAGEINDEX_INDEX_MODEL` becomes `--index-model`; the CLI uses `OPENAI_*`
-only (per-role overrides apply to the API). OCR is set with flags:
-`--ocr {off,auto,force}` and `--ocr-model <model>`.
+only (per-role overrides apply to the API). For `--pdf_path` runs,
+`PAGEINDEX_OCR` becomes `--ocr` and `PAGEINDEX_OCR_MODEL` becomes
+`--ocr-model`; flags you pass explicitly win. `--md_path` runs ignore both.
+The CLI takes `PAGEINDEX_OCR` literally: use lowercase `off`, `auto` or
+`force`.
 
 ## Troubleshooting
 
