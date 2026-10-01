@@ -54,7 +54,8 @@ if __name__ == "__main__":
                       help='Refine the tree for search cost (default: full in flash mode). '
                            '`merge` for deterministic merge only; `off` to disable')
 
-    parser.add_argument('--ocr', choices=list(OCR_MODES), default=None,
+    parser.add_argument('--ocr', type=lambda value: value.strip().lower(),
+                      choices=list(OCR_MODES), default=None,
                       help="OCR through the index model's vision input: auto transcribes pages "
                            'without a text layer (and, in standard mode, describes figure-heavy '
                            'pages), force transcribes every page, off reads the text layer only. '

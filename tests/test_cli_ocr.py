@@ -181,6 +181,11 @@ def test_ocr_flags_require_pdf_path(cli, tmp_path):
         cli("--md_path", str(md), "--ocr-model", "m")
 
 
+def test_ocr_mode_ignores_letter_case(cli, tmp_path):
+    seen = cli("--pdf_path", _scanned_pdf(tmp_path), "--ocr", " Force ")
+    assert seen["vision"]
+
+
 def test_unknown_ocr_mode_is_a_usage_error(cli, tmp_path):
     with pytest.raises(SystemExit):
         cli("--pdf_path", _text_pdf(tmp_path), "--ocr", "always")

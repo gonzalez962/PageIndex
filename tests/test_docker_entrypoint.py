@@ -1,6 +1,6 @@
 """The Dockerfile ENTRYPOINT maps PAGEINDEX_INDEX_MODEL to --index-model,
-PAGEINDEX_OCR / PAGEINDEX_OCR_MODEL to --ocr / --ocr-model for --pdf_path
-runs, and passes every other argument through unchanged. Runs the real
+PAGEINDEX_OCR to --ocr for --pdf_path runs (PAGEINDEX_OCR_MODEL is left to
+the API, whose provider may differ from the CLI's), and passes every other argument through unchanged. Runs the real
 ENTRYPOINT string under sh with a stub `python` that echoes its arguments."""
 import json
 import os
@@ -54,7 +54,7 @@ def test_ocr_env_becomes_ocr_flags_for_pdf_runs(tmp_path):
                 PAGEINDEX_OCR_MODEL="openai/vision m")
     # Explicit flags come last, so they win over the environment.
     assert argv == ["run_pageindex.py", "--index-model", "m",
-                    "--ocr", "force", "--ocr-model", "openai/vision m",
+                    "--ocr", "force",
                     "--pdf_path", "data/scan b.png", "--ocr", "off"]
 
 
