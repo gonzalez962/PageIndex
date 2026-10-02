@@ -813,9 +813,9 @@ def test_submit_missing_llm_key_fails_loud(local_client, sample_pdf, monkeypatch
 def test_submit_rejections(local_client, sample_pdf, tmp_path):
     with pytest.raises(FileNotFoundError):
         local_client.submit_document(str(tmp_path / "missing.pdf"))
-    (tmp_path / "notes.txt").write_text("hi")
+    (tmp_path / "notes.docx").write_text("hi")
     with pytest.raises(PageIndexAPIError, match="only PDF files and PNG or JPEG"):
-        local_client.submit_document(str(tmp_path / "notes.txt"))
+        local_client.submit_document(str(tmp_path / "notes.docx"))
     with pytest.raises(PageIndexAPIError, match="unknown local processing mode"):
         local_client.submit_document(sample_pdf, mode="mcp")
     with pytest.raises(PageIndexAPIError, match="folders"):

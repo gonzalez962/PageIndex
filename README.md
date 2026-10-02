@@ -96,6 +96,14 @@ answer = client.chat("What was the 2023 operating margin?", doc_id=doc_id)
 print(answer)
 ```
 
+Local mode also accepts UTF-8 Markdown (`.md`, `.markdown`) and plain text (`.txt`), with extensions matched case-insensitively. A UTF-8 BOM is fine; files containing NUL bytes or only whitespace are rejected. Markdown with recognized headings (`#` through `######`, or a whole-line `**bold**` heading) uses the heading tree as its structure, with each section becoming a page; text before the first heading is placed in a “Preamble” node. Fenced-code headings do not count. The structure is built without an LLM call, though the index model still generates node summaries and the document description. Plain text and Markdown without headings are split into pages of about 1,000 tokens along paragraph boundaries and use the standard pipeline, where the LLM infers the structure. Text documents use standard mode even when flash is requested, and do not use OCR settings.
+
+```python
+doc_id = client.submit_document("notes.md")["doc_id"]
+```
+
+The CLI is unchanged: `run_pageindex.py --md_path` accepts Markdown through its own path; `.txt` is not a CLI input.
+
 ### Model Recommendations
 
 - **`index=`: a basic model is sufficient.** The tree structure itself is extracted from the document layout without an LLM; the index model only summarizes and refines it, which a basic model does well.

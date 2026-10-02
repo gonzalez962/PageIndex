@@ -90,10 +90,24 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 ```
 
 PNG and JPEG images (`png`, `jpg`, `jpeg`) upload the same way
-(`-F file=@scan.png`); other image formats are refused. The extension picks
-the kind and the content must match it: a PDF header, or a PNG or JPEG
-image. Only the first frame is read, so an animated PNG is one page.
-Scanned pages and images are read by OCR; see [OCR](#ocr).
+(`-F file=@scan.png`); other image formats are refused. The API also accepts
+UTF-8 Markdown (`.md`, `.markdown`) and plain text (`.txt`), case-insensitively.
+A UTF-8 BOM is fine; text containing NUL bytes or only whitespace is rejected.
+Markdown with recognized headings (`#` through `######`, or a whole-line
+`**bold**` heading; headings inside fenced code blocks do not count) uses its
+heading tree as the document structure, with each section becoming a page and
+any text before the first heading placed in a “Preamble” node. No LLM call
+builds that structure, but the index model still generates node summaries and
+the document description. Plain text and Markdown without headings are split
+into pages of about 1,000 tokens along paragraph boundaries and indexed by the
+standard pipeline, where the LLM infers the structure. Text documents use
+standard mode even when flash is requested, and OCR settings do not apply;
+they are accepted even when OCR is off.
+
+The extension picks the kind and the content must match it: a PDF header,
+valid UTF-8 text, or a PNG or JPEG image. Only the first frame is read, so an
+animated PNG is one page. Scanned pages and images are read by OCR; see
+[OCR](#ocr).
 
 An uploaded image is stored, and indexed, under a fresh UUID name
 (`<32 hex digits>.png` or `.jpg`), so uploading `scan.png` twice never
@@ -105,7 +119,8 @@ curl -s -H "Authorization: Bearer $TOKEN" -F file=@scan.png   http://127.0.0.1:8
 # {"job_id":"job-7c1e...","status":"queued","name":"5b0e...c4.png","original_name":"scan.png"}
 ```
 
-PDF uploads keep their file name and have no `original_name`.
+PDF, Markdown, and text uploads keep their file name and have no
+`original_name`; only image uploads are renamed to UUIDs.
 
 `GET /jobs` lists jobs newest first (`status`, `limit`, `offset` filters), and
 `/health` reports `"queue": {"queued": n, "processing": n}`.
@@ -113,12 +128,12 @@ PDF uploads keep their file name and have no `original_name`.
 | Status | Meaning |
 |--------|---------|
 | 202 | Upload or retry accepted; follow the `Location` header to the job |
-| 400 | Content that is not a PDF, PNG or JPEG, an invalid `Content-Length`, or the SDK rejected the input |
+| 400 | Content that does not match its PDF, PNG, JPEG, or text extension (including invalid UTF-8, NUL bytes, or blank text), an invalid `Content-Length`, or the SDK rejected the input |
 | 401 | Missing or wrong bearer token |
 | 404 | Unknown document or job |
 | 409 | Retry of a job that is queued, running, or already done |
 | 413 | Upload over `PAGEINDEX_MAX_UPLOAD_MB`; a declared `Content-Length` over the limit is refused before the body is read |
-| 415 | Not a `.pdf`, `.png`, `.jpg` or `.jpeg` file |
+| 415 | Not a `.pdf`, `.png`, `.jpg`, `.jpeg`, `.md`, `.markdown` or `.txt` file |
 | 502 | The model provider failed (model name, base URL, or key); a `NotFoundError` adds a hint about the `openai/` prefix, and an OCR image rejection says the model may not support image input |
 | 503 | The model client cannot be built (check the logs), or the upload could not be stored (retry later) |
 
@@ -153,7 +168,7 @@ model through its vision input, so that model (or `PAGEINDEX_OCR_MODEL`)
   pages mostly covered by images get a figure description appended. Text-only
   PDFs make no extra calls.
 - `force`: every page is transcribed.
-- `off`: text layer only; scanned PDFs fail as blank and image uploads fail.
+- `off`: text layer only; scanned PDFs fail as blank and image uploads fail. Markdown and text uploads are accepted; OCR settings do not apply to them.
 
 Each OCR'd or described page costs one vision call. Documents that needed OCR
 are indexed in standard mode (slower than flash).

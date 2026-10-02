@@ -770,7 +770,8 @@ class PageIndexClient:
         ``get_document(doc_id)['status']`` yourself.
 
         Local: indexes the document in this call and stores it under
-        ``storage_path``. Defaults to Flash indexing: layout-based extraction,
+        ``storage_path``. PDFs and images use Flash by default; text and Markdown
+        use the standard pipeline. Defaults to Flash indexing: layout-based extraction,
         refined for retrieval (a deterministic merge, then an LLM expansion
         pass); node summaries, the expansion pass, and the document
         description use ``summary_model``. Pass ``mode="standard"`` for a
@@ -781,9 +782,10 @@ class PageIndexClient:
         PDF text layer only.
 
         Args:
-            file_path (str): Path to the PDF file — locally also an image
-                (png, jpg, jpeg; only the first frame of an animated
-                PNG), indexed through OCR.
+            file_path (str): Path to a supported document — locally a PDF,
+                text file (.txt), Markdown (.md/.markdown), or image (png,
+                jpg, jpeg; only the first frame of an animated PNG), indexed
+                through OCR.
             mode (str, optional): Processing mode. Local defaults to "flash";
                 pass "standard" for a full LLM-built tree. Cloud modes are
                 passed through (e.g. "mcp").
