@@ -1,0 +1,42 @@
+# Shared build and environment. .env is optional so `docker compose config`
+# works before it exists; copy .env.example to .env to configure the provider.
+x-pageindex: &pageindex
+  build: .
+  image: pageindex:local
+  env_file:
+    - path: .env
+      required: false
+
+services:
+  # HTTP API: docker compose up -d api
+  api:
+    <<: *pageindex
+    # Must stay a single process: the job queue and the orphan sweep are
+    # per-process. Do not add --workers or scale this service.
+    entrypoint: ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      # Loopback only. Set PAGEINDEX_API_TOKEN before exposing it further.
+      - "127.0.0.1:${PAGEINDEX_PORT:-8000}:8000"
+    volumes:
+      # Indexed documents survive restarts and rebuilds.
+      - storage:/app/storage
+    healthcheck:
+      # The slim image has no curl; use Python.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  # One-shot CLI indexer: docker compose --profile cli run --rm cli --pdf_path data/file.pdf
+  cli:
+    <<: *pageindex
+    profiles: ["cli"]
+    volumes:
+      # Put input documents in ./data; structures are written to ./results.
+      - ./data:/app/data:ro
+      - ./results:/app/results
+
+volumes:
+  storage:
