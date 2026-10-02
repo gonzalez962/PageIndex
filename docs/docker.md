@@ -52,14 +52,17 @@ when no token is configured. `/health` never needs it.
 curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"question": "What are the key findings?", "doc_id": "<doc_id>"}' \
   http://127.0.0.1:8000/chat
-# {"answer":"..."}
+# {"answer":"... [1]","citations":[...],"sources_read":[...]}
 ```
 
 `doc_id` accepts one id, a list of ids, or `null` (the whole library).
 Interactive docs are served at `http://127.0.0.1:8000/docs`.
 
-Two optional flags return where the answer came from, in fields of their own
-(both default to `false`; with both off the response is just `answer`):
+The `citations` and `sources_read` fields tell where the answer came from and
+are returned by default (both default to `true`). A plain request with
+`{"question": "...", "doc_id": "..."}` returns `answer`, `citations`, and
+`sources_read`. Send both flags as `false` to use the legacy response containing
+only `answer`; each flag can also be disabled independently:
 
 - `"citations": true` asks the model to cite each claim. The answer keeps
   `[n]` markers and `citations` lists one entry per distinct source:
@@ -77,7 +80,7 @@ Both come from the same single chat run.
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"question": "What is the payment term?", "doc_id": "<doc_id>", "citations": true, "sources_read": true}' \
+  -d '{"question": "What is the payment term?", "doc_id": "<doc_id>"}' \
   http://127.0.0.1:8000/chat
 # {"answer":"The term is 30 days [1].",
 #  "citations":[{"index":1,"document":"notes.md","doc_id":"pi-...","page":3,"section":"Payment terms"}],

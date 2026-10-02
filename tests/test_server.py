@@ -54,7 +54,7 @@ class FakeClient:
         self.submit_error = None
         self.metadata = []
         self.gate = None
-        self.chat_stream = None
+        self.chat_stream = FakeStream([{"type": "answer", "delta": "answer"}])
         self.chat_calls = []
         self.citation_entries = []
         self.citation_error = None
@@ -856,13 +856,34 @@ def test_delete_document(make):
 
 def test_chat_happy_path_single_and_multi_doc(make):
     api, fake = make()
-    res = api.post("/chat", json={"question": "what?", "doc_id": "pi-1"})
+    res = api.post("/chat", json={"question": "what?", "doc_id": "pi-1",
+                                   "citations": False, "sources_read": False})
     assert res.status_code == 200
     assert res.json() == {"answer": "answer to what?"}
-    api.post("/chat", json={"question": "all?", "doc_id": ["pi-1", "pi-2"]})
-    api.post("/chat", json={"question": "library?"})
+    api.post("/chat", json={"question": "all?", "doc_id": ["pi-1", "pi-2"],
+                             "citations": False, "sources_read": False})
+    api.post("/chat", json={"question": "library?", "citations": False, "sources_read": False})
     assert fake.chats == [("what?", "pi-1"), ("all?", ["pi-1", "pi-2"]),
                           ("library?", None)]
+    assert fake.chat_calls == [("what?", "pi-1", {}), ("all?", ["pi-1", "pi-2"], {}),
+                               ("library?", None, {})]
+
+
+def test_chat_defaults_to_citations_and_sources_read(make):
+    api, fake = make()
+    fake.chat_stream = FakeStream([
+        {"type": "answer", "delta": 'Term <cite doc="a.pdf" page="3"/>'},
+        {"type": "tool_call", "name": "get_page_content", "arguments": {"doc_name": "a.pdf", "pages": "2-3"}},
+    ])
+    fake.citation_entries = [{"document": "a.pdf", "doc_id": "pi-1", "page": 3}]
+    fake.tree = [{"title": "Payment terms", "start_index": 2, "end_index": 3}]
+    res = api.post("/chat", json={"question": "q", "doc_id": "pi-1"})
+    assert res.status_code == 200
+    assert res.json() == {"answer": "Term [1]", "citations": [
+        {"index": 1, "document": "a.pdf", "doc_id": "pi-1", "page": 3, "section": "Payment terms"}],
+        "sources_read": [{"document": "a.pdf", "doc_id": "pi-1", "pages": [2, 3]}]}
+    assert fake.chat_calls == [("q", "pi-1", {"citations": True, "stream": True, "show_process": False})]
+    assert fake.chat_stream.closed
 
 
 def test_chat_optional_sources_shape_and_single_stream(make):
@@ -893,7 +914,7 @@ def test_chat_citations_only_omits_sources_read(make):
     api, fake = make()
     fake.chat_stream = FakeStream([{"type": "answer", "delta": 'A <cite doc="a.pdf" page="1"/>'}])
     fake.citation_entries = [{"document": "a.pdf", "doc_id": "pi-1", "page": 1}]
-    response = api.post("/chat", json={"question": "q", "citations": True})
+    response = api.post("/chat", json={"question": "q", "citations": True, "sources_read": False})
     assert response.json() == {"answer": "A [1]", "citations": [
         {"index": 1, "document": "a.pdf", "doc_id": "pi-1", "page": 1, "section": None}]}
     assert "sources_read" not in response.json()
@@ -905,7 +926,7 @@ def test_chat_sources_read_only_keeps_answer_and_omits_citations(make):
     fake.chat_stream = FakeStream([{"type": "answer", "delta": 'Literal <cite doc="a.pdf" page="1"/>'},
                                    {"type": "tool_call", "name": "get_page_content",
                                     "arguments": {"doc_name": "a.pdf", "pages": "2"}}])
-    response = api.post("/chat", json={"question": "q", "sources_read": True})
+    response = api.post("/chat", json={"question": "q", "citations": False, "sources_read": True})
     assert response.json() == {"answer": 'Literal <cite doc="a.pdf" page="1"/>',
                                "sources_read": [{"document": "a.pdf", "doc_id": "pi-1", "pages": [2]}]}
     assert "citations" not in response.json()
@@ -927,9 +948,9 @@ def test_chat_stream_closes_after_success_and_event_error_matches_legacy(make):
     assert api.post("/chat", json={"question": "q", "citations": True}).status_code == 200
     assert fake.chat_stream.closed
     fake.chat_stream = FakeStream([], events_error=PageIndexAPIError("Documents not found or access denied: pi-x"))
-    stream_error = api.post("/chat", json={"question": "q", "sources_read": True})
+    stream_error = api.post("/chat", json={"question": "q", "citations": False, "sources_read": True})
     fake.chat_error = PageIndexAPIError("Documents not found or access denied: pi-x")
-    legacy_error = api.post("/chat", json={"question": "q"})
+    legacy_error = api.post("/chat", json={"question": "q", "citations": False, "sources_read": False})
     assert fake.chat_stream.closed
     assert (stream_error.status_code, stream_error.json()["detail"]) == (legacy_error.status_code, legacy_error.json()["detail"])
 
@@ -973,6 +994,8 @@ def test_chat_unknown_doc_is_404(make):
     fake.chat_error = PageIndexAPIError("Documents not found or access denied: pi-x")
     api, _ = make(client=fake)
     assert api.post("/chat", json={"question": "q", "doc_id": "pi-x"}).status_code == 404
+    assert api.post("/chat", json={"question": "q", "doc_id": "pi-x",
+                                   "citations": False, "sources_read": False}).status_code == 404
 
 
 def test_chat_upstream_failure_is_502_without_leaking(make):
@@ -983,6 +1006,11 @@ def test_chat_upstream_failure_is_502_without_leaking(make):
     assert res.status_code == 502
     assert "sk-leaky" not in res.text
     assert "FakeUpstreamError" in res.json()["detail"]
+    legacy = api.post("/chat", json={"question": "q", "citations": False,
+                                     "sources_read": False})
+    assert legacy.status_code == 502
+    assert "sk-leaky" not in legacy.text
+    assert "FakeUpstreamError" in legacy.json()["detail"]
 
 
 def test_model_not_found_502_hints_the_openai_prefix(make):

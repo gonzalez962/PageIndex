@@ -246,8 +246,8 @@ def _job_error(exc: Exception) -> str:
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1)
     doc_id: Optional[Union[str, list[str]]] = None
-    citations: bool = False
-    sources_read: bool = False
+    citations: bool = True
+    sources_read: bool = True
 
 
 class CitationResponse(BaseModel):
