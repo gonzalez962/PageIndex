@@ -35,10 +35,12 @@ def test_markdown_sections_nest_and_cover_preamble_pages():
 
     assert pages == ["Preamble.", "# Alpha\nA body.", "## Child\nChild body.", "# Beta\nB body."]
     assert structure == [
-        {"title": "Alpha", "node_id": "0000", "start_index": 2, "end_index": 3,
-         "nodes": [{"title": "Child", "node_id": "0001", "start_index": 3,
+        {"title": "Preamble", "node_id": "0000", "start_index": 1,
+         "end_index": 1, "nodes": []},
+        {"title": "Alpha", "node_id": "0001", "start_index": 2, "end_index": 3,
+         "nodes": [{"title": "Child", "node_id": "0002", "start_index": 3,
                     "end_index": 3, "nodes": []}]},
-        {"title": "Beta", "node_id": "0002", "start_index": 4, "end_index": 4, "nodes": []},
+        {"title": "Beta", "node_id": "0003", "start_index": 4, "end_index": 4, "nodes": []},
     ]
     def check_ranges(nodes, parent=None):
         for node in nodes:
@@ -92,6 +94,11 @@ def test_plain_text_pages_preserve_content_without_splitting_fitting_paragraphs(
     pages = text_document.split_text_pages(content, 11)
     assert pages == ["alpha beta", "gamma delta"]
     assert re.sub(r"\s+", "", "".join(pages)) == re.sub(r"\s+", "", content)
+
+
+def test_blank_line_runs_preserve_round_trip():
+    content = "first\n\n\nsecond\n\n\n\nthird"
+    assert "\n\n".join(text_document.split_text_pages(content, 100)) == content
 
 
 def test_oversized_paragraph_pieces_keep_single_newline_not_paragraph_break():

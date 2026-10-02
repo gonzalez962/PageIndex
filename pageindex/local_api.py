@@ -18,6 +18,13 @@ from .utils import count_tokens, run_off_loop
 
 logger = logging.getLogger(__name__)
 
+
+def _walk_nodes(nodes):
+    for node in nodes:
+        yield node
+        yield from _walk_nodes(node.get("nodes") or [])
+
+
 _SURROGATES = re.compile("[\ud800-\udfff]")
 
 
@@ -112,22 +119,30 @@ class LocalAPI:
             )
         if mode is None:
             mode = "flash"
-        if mode == "standard" and (self._summary_max_words is not None
-                                   or self._summary_concurrency is not None):
-            raise PageIndexAPIError(
-                "Failed to submit document: summary_max_words and "
-                "summary_concurrency are flash-only; mode='standard' does not "
-                "support them.")
         file_path = os.path.abspath(os.path.expanduser(str(file_path)))
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"No such file: {file_path}")
         doc_name = sanitize_filename(os.path.basename(file_path))
         from .ocr import has_image_extension
+        from .text_document import (has_markdown_headings, markdown_section_pages,
+                                    read_text_document, split_text_pages)
         is_image = has_image_extension(doc_name)
-        if not (doc_name.lower().endswith(".pdf") or is_image):
+        extension = os.path.splitext(doc_name)[1].lower()
+        is_text = extension in (".md", ".markdown", ".txt")
+        if mode == "standard" and not is_text and (
+                self._summary_max_words is not None
+                or self._summary_concurrency is not None):
+            raise PageIndexAPIError(
+                "Failed to submit document: summary_max_words and "
+                "summary_concurrency are flash-only; mode='standard' does not "
+                "support them.")
+        if is_text and mode == "flash":
+            logger.info("Text documents use the standard indexing pipeline.")
+        if not (doc_name.lower().endswith(".pdf") or is_image or is_text):
             raise PageIndexAPIError(
                 "Failed to submit document: only PDF files and PNG or JPEG "
-                "images (png, jpg, jpeg) are supported in local mode."
+                "images (png, jpg, jpeg), Markdown (.md, .markdown), and text "
+                "(.txt) are supported in local mode."
             )
         if is_image and self._ocr == "off":
             raise PageIndexAPIError(
@@ -139,21 +154,45 @@ class LocalAPI:
         # check-then-write below still runs under the store lock.
         self._unique_doc_name(doc_name)
 
-        # A converted image lives only for this submit.
-        with tempfile.TemporaryDirectory(prefix="pageindex-") as scratch:
-            pdf_path = file_path
-            if is_image:
-                pdf_path = os.path.join(
-                    scratch, os.path.splitext(doc_name)[0] + ".pdf")
+        if is_text:
+            try:
+                text = read_text_document(file_path)
+            except ValueError as exc:
+                raise PageIndexAPIError(f"Failed to submit document: {exc}") from exc
+            if extension in (".md", ".markdown") and has_markdown_headings(text):
+                page_texts, structure = markdown_section_pages(text, model=self._model)
                 try:
-                    from .ocr import image_to_pdf
-                    image_to_pdf(file_path, pdf_path)
-                except Exception as e:
+                    structure, description = self._index_markdown(page_texts, structure)
+                except PageIndexAPIError:
+                    raise
+                except Exception as exc:
                     raise PageIndexAPIError(
-                        f"Failed to submit document: could not read image: {e}"
-                    ) from e
-            structure, description, page_texts, mode = self._index_file(
-                pdf_path, doc_name, mode, needs_text_pipeline=is_image)
+                        f"Failed to submit document: {exc}") from exc
+                mode = "markdown"
+            else:
+                page_texts = split_text_pages(text, model=self._model)
+                try:
+                    structure, description = run_off_loop(
+                        self._with_backend, self._index_standard, file_path, page_texts)
+                except Exception as exc:
+                    raise PageIndexAPIError(f"Failed to submit document: {exc}") from exc
+                mode = "standard"
+        else:
+            # A converted image lives only for this submit.
+            with tempfile.TemporaryDirectory(prefix="pageindex-") as scratch:
+                pdf_path = file_path
+                if is_image:
+                    pdf_path = os.path.join(
+                        scratch, os.path.splitext(doc_name)[0] + ".pdf")
+                    try:
+                        from .ocr import image_to_pdf
+                        image_to_pdf(file_path, pdf_path)
+                    except Exception as e:
+                        raise PageIndexAPIError(
+                            f"Failed to submit document: could not read image: {e}"
+                        ) from e
+                structure, description, page_texts, mode = self._index_file(
+                    pdf_path, doc_name, mode, needs_text_pipeline=is_image)
         self._check_page_bounds(structure, len(page_texts))
 
         doc_id = "pi-" + uuid.uuid4().hex
@@ -268,6 +307,34 @@ class LocalAPI:
             # surrogates would crash every utf-8 JSON save downstream.
             return [_scrub_surrogates(page.extract_text() or "")
                     for page in reader.pages]
+
+    def _index_markdown(self, page_texts: list[str], structure: list) -> tuple[list, str | None]:
+        """Summarize a Markdown heading tree and generate its description."""
+        import asyncio
+        from .page_index_md import generate_summaries_for_structure_md
+        from .utils import (create_clean_structure_for_description,
+                            generate_doc_description, write_node_id)
+
+        for node in _walk_nodes(structure):
+            own_end = min((child["start_index"] for child in node.get("nodes") or []),
+                          default=node["end_index"] + 1) - 1
+            node["text"] = "\n\n".join(
+                page_texts[node["start_index"] - 1:own_end])
+        summary_model = self._summary_model or self._model
+
+        def summarize():
+            return asyncio.run(generate_summaries_for_structure_md(
+                structure, 200, summary_model))
+
+        structure = run_off_loop(self._with_backend, summarize)
+        description = run_off_loop(
+            self._with_backend, generate_doc_description,
+            create_clean_structure_for_description(structure), summary_model)
+        write_node_id(structure)
+        for node in _walk_nodes(structure):
+            if not node.get("nodes"):
+                node.pop("nodes", None)
+        return structure, description
 
     def _index_standard(self, file_path: str, page_texts: list[str]) -> tuple[list, str | None]:
         from .page_index_classic import page_index_main

@@ -1,6 +1,7 @@
 """Pure helpers for turning text documents into PageIndex pages and trees."""
 
 from pathlib import Path
+import re
 
 from .page_index_md import extract_nodes_from_markdown
 from .utils import count_tokens
@@ -68,17 +69,20 @@ def split_text_pages(text, max_page_tokens=DEFAULT_PAGE_TOKENS, model=None) -> l
     """Pack blank-line-separated paragraphs without emitting empty pages."""
     if max_page_tokens <= 0:
         raise ValueError("max_page_tokens must be greater than zero")
-    paragraphs = [part for part in text.split("\n\n") if part.strip()]
+    parts = re.split(r"(\n\s*\n)", text)
+    paragraphs = [(parts[i].strip("\n"), parts[i + 1] if i + 1 < len(parts) else "")
+                  for i in range(0, len(parts), 2) if parts[i].strip()]
     pages = []
     current = ""
-    for paragraph in paragraphs:
+    for index, (paragraph, separator) in enumerate(paragraphs):
         if count_tokens(paragraph, model=model) > max_page_tokens:
             if current:
                 pages.append(current)
                 current = ""
             pages.extend(_split_paragraph(paragraph, max_page_tokens, model))
             continue
-        candidate = paragraph if not current else current + "\n\n" + paragraph
+        joiner = paragraphs[index - 1][1] if current else ""
+        candidate = paragraph if not current else current + joiner + paragraph
         if current and count_tokens(candidate, model=model) > max_page_tokens:
             pages.append(current)
             current = paragraph
@@ -110,6 +114,11 @@ def markdown_section_pages(text, max_page_tokens=DEFAULT_PAGE_TOKENS, model=None
 
     roots = []
     stack = []
+    if preamble:
+        preamble_start = 1
+        preamble_end = len(pages)
+        roots.append({"title": "Preamble", "start_index": preamble_start,
+                      "end_index": preamble_end, "nodes": []})
     for index, heading in enumerate(headings):
         start_line = heading["line_num"] - 1
         end_line = (headings[index + 1]["line_num"] - 1
@@ -120,7 +129,7 @@ def markdown_section_pages(text, max_page_tokens=DEFAULT_PAGE_TOKENS, model=None
             section_pages = [heading["node_title"]]
         start_page = len(pages) + 1
         pages.extend(section_pages)
-        node = {"title": heading["node_title"], "node_id": str(index).zfill(4),
+        node = {"title": heading["node_title"],
                 "start_index": start_page, "end_index": len(pages), "nodes": []}
         while stack and stack[-1][0] >= heading["level"]:
             stack.pop()
@@ -137,4 +146,6 @@ def markdown_section_pages(text, max_page_tokens=DEFAULT_PAGE_TOKENS, model=None
 
     for root in roots:
         include_descendants(root)
+    from .utils import write_node_id
+    write_node_id(roots)
     return pages, roots
