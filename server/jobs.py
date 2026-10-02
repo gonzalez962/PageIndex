@@ -100,9 +100,12 @@ class JobStore:
 
     # ---------- records ----------
 
-    def create(self, name: str, src_path: str) -> dict:
+    def create(self, name: str, src_path: str,
+               original_name: Optional[str] = None) -> dict:
         """Move the validated upload at ``src_path`` into a new queued job.
-        ``name`` must already be a bare, safe ``.pdf`` file name."""
+        ``name`` must already be a bare, safe upload file name (a PDF or
+        a supported image). ``original_name``, when given, is the name the
+        upload arrived with, kept for display when ``name`` was generated."""
         job_id = "job-" + uuid.uuid4().hex
         job_dir = os.path.join(self._root, job_id)
         os.makedirs(job_dir)
@@ -117,6 +120,8 @@ class JobStore:
                 job = {"id": job_id, "name": name, "status": "queued",
                        "created_at": _iso(now), "updated_at": _iso(now),
                        "doc_id": None, "error": None, "attempts": 0}
+                if original_name is not None:
+                    job["original_name"] = original_name
                 # job.json is written last: a directory without it is ignored.
                 _write_json_atomic(os.path.join(job_dir, _JOB_FILE), job)
                 self._statuses[job_id] = "queued"
@@ -336,8 +341,13 @@ class JobRunner:
                 # rejecting it), so reuse the document tagged with this job.
                 doc_id = _find_doc_for_job(client, job_id)
             if doc_id is None:
+                metadata = {"job_id": job_id}
+                if job.get("original_name"):
+                    # The document is named after the stored file; keep the
+                    # name the user uploaded next to it.
+                    metadata["original_name"] = job["original_name"]
                 result = client.submit_document(self._store.pdf_path(job_id),
-                                                metadata={"job_id": job_id})
+                                                metadata=metadata)
                 doc_id = result["doc_id"]
         except Exception as exc:
             error = self._describe_error(exc)

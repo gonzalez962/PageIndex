@@ -101,6 +101,31 @@ print(answer)
 - **`index=`: a basic model is sufficient.** The tree structure itself is extracted from the document layout without an LLM; the index model only summarizes and refines it, which a basic model does well.
 - **`chat=`: use the best model you can afford.** The chat model searches the tree to retrieve information. See [Query cost and accuracy](#query-cost-and-accuracy).
 
+### Scanned PDFs, figures and images
+
+Local mode reads text-based PDFs, scanned PDFs (no text layer), image-rich PDFs and PNG or JPEG image files (`png`, `jpg`, `jpeg`; other image formats are refused). Only the first frame of an image is read, so an animated PNG is one page. Pages without a usable text layer are transcribed by your index model through its vision input, so **that model must accept images** (or set a separate `ocr_model=`).
+
+```python
+client = PageIndexClient(
+    index={"model": "gpt-5.6-luna",
+           "ocr": "auto",                # "auto" (default) | "force" | "off"
+           "ocr_model": "gpt-5.6-luna"}, # optional; defaults to the index model
+    chat="gpt-5.6-sol",
+)
+doc_id = client.submit_document("scan.png")["doc_id"]
+```
+
+| `ocr` | Behavior |
+|---|---|
+| `"auto"` (default) | Pages with no usable text are transcribed; text pages mostly covered by images keep their text and get a figure/chart description appended. Text-only PDFs make no extra calls. |
+| `"force"` | Every page is transcribed by the vision model. |
+| `"off"` | Text layer only, as before: scanned PDFs are rejected as blank and image files are refused. |
+
+- **Cost:** one vision call per OCR'd or described page.
+- **Pipeline:** a document whose text came from OCR (including every image file) is indexed in standard mode, since flash reads the PDF text layer only. `get_ocr()` returns the transcribed or figure-augmented page text.
+- **CLI:** `python run_pageindex.py --pdf_path scan.png --ocr auto --ocr-model <vision-model>`; `--pdf_path` accepts the same PNG and JPEG files.
+- If the provider rejects image input, indexing fails once with an error saying the OCR model may not support images.
+
 ### [Use PageIndex through the SDK client →](https://docs.pageindex.ai/getting-started)
 
 Configure other models, streaming, multi-document search, citations, and more.
@@ -198,11 +223,11 @@ print(client.chat("What was the 2023 operating margin?", doc_id=doc_id))
 
 | | **Local** | **Cloud** |
 |---|---|---|
-| Handles | Text-based PDFs | Text-based, scanned, and image-rich documents |
+| Handles | Text-based, scanned and image-rich PDFs, image files | Text-based, scanned, and image-rich documents |
 | Indexing | On your machine | Managed by PageIndex |
 | Storage | Local directory | Cloud storage |
 | Citations | Page-level | Block-level |
-| OCR & image understanding | — | ✓ |
+| OCR & image understanding | ✓ (your vision model) | ✓ |
 | [Metadata](https://docs.pageindex.ai/sdk/documents#metadata-cloud) | — | ✓ |
 | [Folders](https://docs.pageindex.ai/sdk/documents#folders-cloud) | — | ✓ |
 | [MCP server](https://docs.pageindex.ai/mcp) | — | ✓ |

@@ -152,7 +152,7 @@ def _needs_model(surface: str) -> PageIndexAPIError:
 
 _LOCAL_INDEX_KEYS = ("model", "summary_model", "backend", "storage_path",
                      "summary_max_words", "summary_concurrency",
-                     "use_embedded_toc", "optimize")
+                     "use_embedded_toc", "optimize", "ocr", "ocr_model")
 
 # Near-synonyms of "cloud" that would otherwise parse as model names —
 # a silent wrong mode. They error, pointing at the real word.
@@ -179,6 +179,7 @@ _ARG_TYPES: "dict[str, tuple[type, ...]]" = {
     "model": (str,), "index_model": (str,), "summary_model": (str,),
     "chat_model": (str,), "retrieve_model": (str,), "summary_max_words": (int,),
     "summary_concurrency": (int,), "use_embedded_toc": (bool,), "optimize": (str,),
+    "ocr": (str,), "ocr_model": (str,),
     "storage_path": (str, os.PathLike), "index_backend": (dict,),
     "chat_backend": (dict,)}
 
@@ -357,7 +358,7 @@ class PageIndexClient:
             dict: ``{"api_key": ...}`` for cloud, ``{"model",
             "summary_model", "backend", "storage_path",
             "summary_max_words", "summary_concurrency", "use_embedded_toc",
-            "optimize"}`` for local. An
+            "optimize", "ocr", "ocr_model"}`` for local. An
             optional ``"mode"`` key (``"cloud"`` / ``"local"``) states
             the side and must agree with the other keys; ``{"mode":
             "cloud"}`` alone reads the key from the environment. Not
@@ -417,6 +418,15 @@ class PageIndexClient:
         optimize (str, optional): Local mode only — the flash tree
             refinement pass: ``"full"`` (merge + model expand, the
             default), ``"merge"`` (deterministic merge only) or ``"off"``.
+        ocr (str, optional): Local mode only — OCR through the indexing
+            model's vision input: ``"auto"`` (the default) transcribes
+            pages without a usable text layer and appends a description
+            to text pages dominated by figures; ``"force"`` transcribes
+            every page; ``"off"`` reads the PDF text layer only. One
+            vision call per OCR'd page; the model must accept images.
+        ocr_model (str, optional): Local mode only — the vision model OCR
+            uses. Defaults to the index model; it runs with
+            ``index_backend``.
         retrieve_model (str, optional): Legacy name for ``chat_model`` —
             same meaning everywhere, cloud clients included.
         storage_path (str or os.PathLike, optional): Local mode only —
@@ -445,7 +455,8 @@ class PageIndexClient:
     construction instead of inferring it from api_key.
 
     Local mode differences (all documented per method): indexing is
-    synchronous, only PDFs are supported, and folders / ``beta_headers`` /
+    synchronous, PDFs and PNG/JPEG images (png, jpg, jpeg) are
+    supported, and folders / ``beta_headers`` /
     the deprecated retrieval API (``submit_query``, ``get_retrieval``) are
     cloud-only.
     """
@@ -469,6 +480,8 @@ class PageIndexClient:
         summary_concurrency: Optional[int] = None,
         use_embedded_toc: Optional[bool] = None,
         optimize: Optional[str] = None,
+        ocr: Optional[str] = None,
+        ocr_model: Optional[str] = None,
         retrieve_model: Optional[str] = None,
         storage_path: Optional[Union[str, os.PathLike[str]]] = None,
         index_backend: Optional[dict[str, Any]] = None,
@@ -498,6 +511,8 @@ class PageIndexClient:
              ("summary_concurrency", summary_concurrency),
              ("use_embedded_toc", use_embedded_toc),
              ("optimize", optimize),
+             ("ocr", ocr),
+             ("ocr_model", ocr_model),
              ("index_backend", index_backend),
              ("storage_path", storage_path), ("model", model))
             if value is not None}
@@ -585,6 +600,9 @@ class PageIndexClient:
                 if name == "optimize" and value not in ("full", "merge", "off"):
                     raise PageIndexAPIError(
                         f'{shown} must be "full", "merge" or "off", got {value!r}.')
+                if name == "ocr" and value not in ("off", "auto", "force"):
+                    raise PageIndexAPIError(
+                        f'{shown} must be "off", "auto" or "force", got {value!r}.')
                 if (name in ("summary_max_words", "summary_concurrency")
                         and isinstance(value, int) and value < 1):
                     raise PageIndexAPIError(
@@ -662,6 +680,8 @@ class PageIndexClient:
                 summary_concurrency=index_conf.get("summary_concurrency"),
                 use_embedded_toc=index_conf.get("use_embedded_toc", True),
                 optimize=index_conf.get("optimize", "full"),
+                ocr=index_conf.get("ocr", "auto"),
+                ocr_model=index_conf.get("ocr_model"),
             )
             # LiteLLM's multi-second import would otherwise land on the
             # first chat call; failures resurface there with real context.
@@ -743,7 +763,7 @@ class PageIndexClient:
         wait: bool = False,
     ) -> dict[str, Any]:
         """
-        Submit a PDF document for processing. Returns {'doc_id': ..., 'name': ...}.
+        Submit a document for processing. Returns {'doc_id': ..., 'name': ...}.
 
         Cloud: uploads the file; processing is asynchronous. Pass
         ``wait=True`` to block until the document is ready, or poll
@@ -755,10 +775,15 @@ class PageIndexClient:
         pass); node summaries, the expansion pass, and the document
         description use ``summary_model``. Pass ``mode="standard"`` for a
         full LLM-built tree (slower). ``beta_headers`` and ``folder_id`` are
-        cloud-only.
+        cloud-only. Local OCR (the client's ``ocr`` option) transcribes
+        scanned pages and image files with the indexing model; a document
+        that needed it is indexed in standard mode, since flash reads the
+        PDF text layer only.
 
         Args:
-            file_path (str): Path to the PDF file.
+            file_path (str): Path to the PDF file — locally also an image
+                (png, jpg, jpeg; only the first frame of an animated
+                PNG), indexed through OCR.
             mode (str, optional): Processing mode. Local defaults to "flash";
                 pass "standard" for a full LLM-built tree. Cloud modes are
                 passed through (e.g. "mcp").
@@ -846,9 +871,10 @@ class PageIndexClient:
             dict: {'doc_id', 'status', 'retrieval_ready', 'result', ...}.
             With 'page', result entries are {'page_index', 'markdown', ...}.
 
-        Local: the "OCR" result is the text extracted from the PDF while
-        indexing (no OCR model runs locally, so scanned/image-only PDFs have
-        no local text).
+        Local: the "OCR" result is the page text stored while indexing —
+        the PDF text layer, or the vision model's transcription for pages
+        OCR read (see the client's ``ocr`` option), with figure
+        descriptions appended where OCR added them.
         """
         return self._api.get_ocr(doc_id=doc_id, format=format)
 
@@ -2692,6 +2718,8 @@ class PageIndexLocalClient(PageIndexClient):
         summary_concurrency: Optional[int] = None,
         use_embedded_toc: Optional[bool] = None,
         optimize: Optional[str] = None,
+        ocr: Optional[str] = None,
+        ocr_model: Optional[str] = None,
         retrieve_model: Optional[str] = None,
         storage_path: Optional[Union[str, os.PathLike[str]]] = None,
         index_backend: Optional[dict[str, Any]] = None,
@@ -2704,6 +2732,7 @@ class PageIndexLocalClient(PageIndexClient):
                          summary_max_words=summary_max_words,
                          summary_concurrency=summary_concurrency,
                          use_embedded_toc=use_embedded_toc, optimize=optimize,
+                         ocr=ocr, ocr_model=ocr_model,
                          retrieve_model=retrieve_model, storage_path=storage_path,
                          index_backend=index_backend, chat_backend=chat_backend,
                          instructions=instructions)

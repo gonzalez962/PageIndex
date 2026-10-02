@@ -41,7 +41,7 @@ when no token is configured. `/health` never needs it.
 
 | Action | Request |
 |--------|---------|
-| Index a PDF | see [Index a PDF](#index-a-pdf) |
+| Index a PDF or image | see [Index a PDF](#index-a-pdf) |
 | List jobs | `curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/jobs?status=failed"` |
 | List documents | `curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8000/documents?limit=50&offset=0"` |
 | Get one | `curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/documents/<doc_id>` |
@@ -89,19 +89,37 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
   http://127.0.0.1:8000/jobs/job-3f2a.../retry
 ```
 
+PNG and JPEG images (`png`, `jpg`, `jpeg`) upload the same way
+(`-F file=@scan.png`); other image formats are refused. The extension picks
+the kind and the content must match it: a PDF header, or a PNG or JPEG
+image. Only the first frame is read, so an animated PNG is one page.
+Scanned pages and images are read by OCR; see [OCR](#ocr).
+
+An uploaded image is stored, and indexed, under a fresh UUID name
+(`<32 hex digits>.png` or `.jpg`), so uploading `scan.png` twice never
+collides. The name you uploaded is kept as `original_name` in the upload
+response, the job, and the document's `metadata`:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" -F file=@scan.png   http://127.0.0.1:8000/documents
+# {"job_id":"job-7c1e...","status":"queued","name":"5b0e...c4.png","original_name":"scan.png"}
+```
+
+PDF uploads keep their file name and have no `original_name`.
+
 `GET /jobs` lists jobs newest first (`status`, `limit`, `offset` filters), and
 `/health` reports `"queue": {"queued": n, "processing": n}`.
 
 | Status | Meaning |
 |--------|---------|
 | 202 | Upload or retry accepted; follow the `Location` header to the job |
-| 400 | Not a PDF, an invalid `Content-Length`, or the SDK rejected the input |
+| 400 | Content that is not a PDF, PNG or JPEG, an invalid `Content-Length`, or the SDK rejected the input |
 | 401 | Missing or wrong bearer token |
 | 404 | Unknown document or job |
 | 409 | Retry of a job that is queued, running, or already done |
 | 413 | Upload over `PAGEINDEX_MAX_UPLOAD_MB`; a declared `Content-Length` over the limit is refused before the body is read |
-| 415 | Not a `.pdf` file |
-| 502 | The model provider failed (model name, base URL, or key); a `NotFoundError` adds a hint about the `openai/` prefix |
+| 415 | Not a `.pdf`, `.png`, `.jpg` or `.jpeg` file |
+| 502 | The model provider failed (model name, base URL, or key); a `NotFoundError` adds a hint about the `openai/` prefix, and an OCR image rejection says the model may not support image input |
 | 503 | The model client cannot be built (check the logs), or the upload could not be stored (retry later) |
 
 ## Configuration
@@ -119,9 +137,26 @@ All settings live in `.env`; see `.env.example` for the annotated list.
 | `PAGEINDEX_PORT` | `8000` | Host port, bound on `127.0.0.1` only |
 | `PAGEINDEX_MAX_UPLOAD_MB` | `50` | Upload size limit; a finite number > 0 that is at least 1 byte (e.g. `0.5`) |
 | `PAGEINDEX_INDEX_WORKERS` | `1` | Documents indexed in parallel; an integer >= 1 |
+| `PAGEINDEX_OCR` | `auto` | OCR mode: `off`, `auto` or `force`, any letter case (API and CLI) |
+| `PAGEINDEX_OCR_MODEL` | index model | Vision model for OCR (API only); uses the indexing provider |
 
-An invalid `PAGEINDEX_MAX_UPLOAD_MB` or `PAGEINDEX_INDEX_WORKERS` stops the API
-at startup with a message naming the variable.
+An invalid `PAGEINDEX_MAX_UPLOAD_MB`, `PAGEINDEX_INDEX_WORKERS` or
+`PAGEINDEX_OCR` stops the API at startup with a message naming the variable.
+
+### OCR
+
+Scanned PDFs, image uploads and figure-heavy pages are read by the indexing
+model through its vision input, so that model (or `PAGEINDEX_OCR_MODEL`)
+**must accept images**.
+
+- `auto` (default): pages without a usable text layer are transcribed; text
+  pages mostly covered by images get a figure description appended. Text-only
+  PDFs make no extra calls.
+- `force`: every page is transcribed.
+- `off`: text layer only; scanned PDFs fail as blank and image uploads fail.
+
+Each OCR'd or described page costs one vision call. Documents that needed OCR
+are indexed in standard mode (slower than flash).
 
 Restart after editing `.env`: `docker compose up -d api`.
 
@@ -155,7 +190,7 @@ Chat, listing, and `/health` stay responsive while documents are indexed.
 
 ## CLI indexer
 
-Put PDFs in `./data`; tree structures are written to `./results`.
+Put PDFs or PNG/JPEG images in `./data`; tree structures are written to `./results`.
 
 ```bash
 docker compose --profile cli run --rm cli --pdf_path data/report.pdf
@@ -163,7 +198,11 @@ docker compose --profile cli run --rm cli --help
 ```
 
 `PAGEINDEX_INDEX_MODEL` becomes `--index-model`; the CLI uses `OPENAI_*`
-only (per-role overrides apply to the API).
+only (per-role overrides apply to the API). For `--pdf_path` runs,
+`PAGEINDEX_OCR` becomes `--ocr`; a flag you pass explicitly wins, and
+`--md_path` runs ignore it. `PAGEINDEX_OCR_MODEL` is not passed to the CLI,
+because it names a model on the API's indexing provider; the CLI OCRs with
+its index model unless you pass `--ocr-model` yourself.
 
 ## Troubleshooting
 
@@ -176,4 +215,5 @@ only (per-role overrides apply to the API).
 | `./results` files owned by root (Linux) | The image runs as root. Run `sudo chown -R "$USER" results`, or pass `--user "$(id -u):$(id -g)"` to `docker compose run`. |
 | 503 "Model client is not configured", or `/health` 503 | The client could not be built from `.env`; `docker compose logs api` has the cause. Fix `.env`, then `docker compose up -d api`. A running API retries a failed build at most every 30 s. |
 | 502 with `NotFoundError` | The provider does not know the model. If its id contains `/`, prefix it with `openai/` so it goes to `OPENAI_BASE_URL`. |
+| A job `failed`: the OCR model may not support image input | Point `PAGEINDEX_OCR_MODEL` (or `PAGEINDEX_INDEX_MODEL`) at a vision-capable model, or set `PAGEINDEX_OCR=off` for text-only PDFs. |
 | 502 from `/chat`, or a job `failed` with an upstream provider error | Provider rejected the call; check `docker compose logs api`, the model name, base URL, and key, then retry the job. |

@@ -36,6 +36,8 @@ class LocalIndexConfig(TypedDict, total=False):
     summary_concurrency: int
     use_embedded_toc: bool
     optimize: Literal["full", "merge", "off"]
+    ocr: Literal["off", "auto", "force"]
+    ocr_model: str
     backend: dict
     storage_path: Union[str, os.PathLike[str]]
 

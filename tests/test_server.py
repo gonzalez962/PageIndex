@@ -857,3 +857,168 @@ def test_chat_retries_exhausted_is_502(make):
     fake.chat_error = LLMRetriesExhausted("gave up", status_code=503)
     api, _ = make(client=fake)
     assert api.post("/chat", json={"question": "q"}).status_code == 502
+
+
+# ---------- images and OCR ----------
+
+def _png_bytes(fmt="PNG"):
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (40, 30), "white").save(buf, fmt)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("name,fmt", [("scan.png", "PNG"), ("photo.JPG", "JPEG"),
+                                      ("photo.jpeg", "JPEG")])
+def test_upload_accepts_images(make, name, fmt):
+    api, fake = make()
+    data = _png_bytes(fmt)
+    ext = ".png" if name.lower().endswith(".png") else ".jpg"
+    with api:
+        res = upload(api, name, data)
+        assert res.status_code == 202
+        body = res.json()
+        # Stored under a fresh UUID name; the upload name stays visible.
+        assert re.fullmatch(r"[0-9a-f]{32}" + re.escape(ext), body["name"])
+        assert body["original_name"] == name
+        job = wait_for_status(api, body["job_id"], "done")
+    assert job["name"] == body["name"] and job["original_name"] == name
+    path, submitted = fake.submitted[0]
+    assert os.path.basename(path) == body["name"]
+    assert submitted == data
+    assert fake.metadata[0] == {"job_id": body["job_id"], "original_name": name}
+
+
+class UniqueNameClient(FakeClient):
+    """Refuses a document whose file name is already indexed, like a store
+    that keys documents by name."""
+
+    def submit_document(self, file_path, metadata=None):
+        name = os.path.basename(file_path)
+        if any(os.path.basename(path) == name for path, _ in self.submitted):
+            raise PageIndexAPIError(f"Failed to submit document: {name} exists.")
+        return super().submit_document(file_path, metadata)
+
+
+def test_repeated_image_uploads_never_share_a_stored_name(make):
+    api, fake = make(client=UniqueNameClient())
+    with api:
+        bodies = [upload(api, "scan.png", _png_bytes()).json() for _ in range(2)]
+        jobs = [wait_for_status(api, body["job_id"], "done") for body in bodies]
+    names = [body["name"] for body in bodies]
+    assert names[0] != names[1]
+    assert [job["original_name"] for job in jobs] == ["scan.png", "scan.png"]
+    stored = [os.path.basename(path) for path, _ in fake.submitted]
+    assert sorted(stored) == sorted(names)
+    assert [meta["original_name"] for meta in fake.metadata] == ["scan.png"] * 2
+
+
+def test_pdf_uploads_keep_their_name(make):
+    api, fake = make()
+    with api:
+        body = upload(api, "My Report.pdf").json()
+        job = wait_for_status(api, body["job_id"], "done")
+    assert body["name"] == job["name"] == "My Report.pdf"
+    assert "original_name" not in body and "original_name" not in job
+    assert os.path.basename(fake.submitted[0][0]) == "My Report.pdf"
+    assert fake.metadata[0] == {"job_id": body["job_id"]}
+
+
+def test_upload_rejects_disguised_image(make):
+    api, fake = make()
+    for name, data in (("scan.png", PDF_BYTES), ("scan.jpg", b"not an image")):
+        res = upload(api, name, data)
+        assert res.status_code == 400
+        assert "not a supported image" in res.json()["detail"]
+    assert fake.submitted == []
+    assert api.get("/jobs").json()["total"] == 0
+
+
+def test_upload_rejects_decompression_bombs_with_400(make, monkeypatch):
+    from PIL import Image
+    api, fake = make()
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 100)  # _png_bytes: 1200 px
+    res = upload(api, "huge.png", _png_bytes())
+    assert res.status_code == 400
+    assert "not a supported image" in res.json()["detail"]
+    assert fake.submitted == []
+    assert api.get("/jobs").json()["total"] == 0
+
+
+def test_upload_rejects_unsupported_types(make):
+    api, fake = make()
+    for name in ("notes.txt", "icon.ico", "scan.svg", ".png"):
+        res = upload(api, name, _png_bytes())
+        assert res.status_code == 415
+        assert "PDF, PNG or JPEG" in res.json()["detail"]
+    assert fake.submitted == []
+
+
+@pytest.mark.parametrize("ext,fmt", [("webp", "WEBP"), ("tif", "TIFF"),
+                                     ("tiff", "TIFF"), ("bmp", "BMP"),
+                                     ("gif", "GIF")])
+def test_upload_accepts_only_png_and_jpeg_images(make, ext, fmt):
+    api, fake = make()
+    data = _png_bytes(fmt)
+    res = upload(api, f"pic.{ext}", data)
+    assert res.status_code == 415
+    assert "(.pdf, .jpeg, .jpg, .png)" in res.json()["detail"]
+    # Their content behind a .png name is not a supported image either.
+    res = upload(api, "pic.png", data)
+    assert res.status_code == 400
+    assert "not a supported image" in res.json()["detail"]
+    assert fake.submitted == []
+    assert api.get("/jobs").json()["total"] == 0
+
+
+def test_image_upload_keeps_the_size_limit(make):
+    api, fake = make(env={"PAGEINDEX_MAX_UPLOAD_MB": repr(100 / (1024 * 1024))})
+    res = api.post("/documents", files={"file": ("big.png", _png_bytes() + b"\0" * 200,
+                                                 "image/png")})
+    assert res.status_code == 413
+    assert fake.submitted == []
+
+
+def test_client_kwargs_carry_ocr_settings():
+    kwargs = client_kwargs({"PAGEINDEX_OCR": " Force ",
+                            "PAGEINDEX_OCR_MODEL": "openai/gpt-4o"})
+    assert kwargs["ocr"] == "force"
+    assert kwargs["ocr_model"] == "openai/gpt-4o"
+    assert "ocr" not in client_kwargs({"PAGEINDEX_OCR": ""})
+
+
+def test_ocr_setting_is_validated(tmp_path):
+    env = {"PAGEINDEX_STORAGE_PATH": str(tmp_path), "PAGEINDEX_OCR": "always"}
+    with pytest.raises(ValueError, match="PAGEINDEX_OCR must be one of off, auto, force"):
+        create_app(client=FakeClient(), env=env)
+    with pytest.raises(ValueError, match="PAGEINDEX_OCR"):
+        client_kwargs({"PAGEINDEX_OCR": "always"})
+    create_app(client=FakeClient(), env={**env, "PAGEINDEX_OCR": "off"})
+
+
+def test_ocr_settings_reach_the_real_client(tmp_path):
+    from server.app import build_client
+    client = build_client({"PAGEINDEX_STORAGE_PATH": str(tmp_path),
+                           "PAGEINDEX_OCR": "off",
+                           "PAGEINDEX_OCR_MODEL": "openai/gpt-4o"})
+    assert (client._api._ocr, client._api._ocr_model) == ("off", "openai/gpt-4o")
+
+
+def test_ocr_image_rejection_fails_job_with_a_hint_and_no_provider_text(make):
+    from pageindex.ocr import OCRModelError
+    fake = FakeClient()
+    cause = FakeUpstreamError("BadRequestError: image_url unsupported, key sk-leaky")
+    ocr_error = OCRModelError(f"The OCR model 'openai/text-model' rejected a page "
+                              f"image; it may not support image input. {cause}")
+    ocr_error.__cause__ = cause
+    err = PageIndexAPIError(f"Failed to submit document: OCR failed: {ocr_error}")
+    err.__cause__ = ocr_error
+    fake.submit_error = err
+    api, _ = make(client=fake, env={"PAGEINDEX_OCR_MODEL": "openai/text-model"})
+    with api:
+        job_id = upload(api, "scan.png", _png_bytes()).json()["job_id"]
+        job = wait_for_status(api, job_id, "failed")
+        assert "sk-leaky" not in api.get(f"/jobs/{job_id}").text
+    assert "may not support image input" in job["error"]
+    assert "PAGEINDEX_OCR" in job["error"]

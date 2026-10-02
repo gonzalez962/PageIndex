@@ -814,7 +814,7 @@ def test_submit_rejections(local_client, sample_pdf, tmp_path):
     with pytest.raises(FileNotFoundError):
         local_client.submit_document(str(tmp_path / "missing.pdf"))
     (tmp_path / "notes.txt").write_text("hi")
-    with pytest.raises(PageIndexAPIError, match="only PDF"):
+    with pytest.raises(PageIndexAPIError, match="only PDF files and PNG or JPEG"):
         local_client.submit_document(str(tmp_path / "notes.txt"))
     with pytest.raises(PageIndexAPIError, match="unknown local processing mode"):
         local_client.submit_document(sample_pdf, mode="mcp")
@@ -916,10 +916,15 @@ def test_submit_metadata_validation(local_client, sample_pdf, monkeypatch):
     assert indexed == []
 
 
-def test_blank_pdf_rejected(local_client, tmp_path):
+def test_blank_pdf_rejected(local_client, tmp_path, monkeypatch):
     from conftest import build_pdf
     blank = tmp_path / "blank.pdf"
     blank.write_bytes(build_pdf(["", ""]))
+
+    async def nothing_to_read(model, prompt):
+        return ""
+    # Blank pages go through OCR first; nothing readable still rejects.
+    monkeypatch.setattr(pageindex.utils, "llm_acompletion", nothing_to_read)
     with pytest.raises(PageIndexAPIError, match="All pages are blank"):
         local_client.submit_document(str(blank))
 
@@ -3313,3 +3318,227 @@ def test_count_tokens_falls_back_to_the_default_tokenizer(monkeypatch):
 
     monkeypatch.setattr(litellm, "token_counter", lambda model=None, text=None, **_: 3 if model else 7)
     assert pageindex.utils.count_tokens("x", model="m") == 3  # the model's own count wins when it works
+
+
+# ── OCR (vision model) ──
+
+def _vision_mock(monkeypatch, answer="Scanned words on the page"):
+    """Mock the multimodal call; records (model, prompt kind, backend)."""
+    from pageindex import ocr
+    calls = []
+
+    async def fake(model, prompt):
+        kind = "transcribe" if prompt[0]["text"] == ocr.TRANSCRIBE_PROMPT else "describe"
+        calls.append((model, kind, pageindex.utils._llm_backend.get()))
+        return answer
+    monkeypatch.setattr(pageindex.utils, "llm_acompletion", fake)
+    return calls
+
+
+def _stub_pipelines(monkeypatch):
+    """Record which pipeline ran and with what pages."""
+    runs = {}
+
+    def fake_main(doc, opt=None, logger=None, page_list=None):
+        runs["standard"] = {"doc": doc, "page_list": page_list,
+                            "exists": os.path.exists(doc)}
+        return {"doc_name": "x", "doc_description": "d.",
+                "structure": [{"title": "T", "start_index": 1,
+                               "end_index": len(page_list), "nodes": []}]}
+
+    def fake_flash(path, **kwargs):
+        runs["flash"] = path
+        return {"structure": [{"title": "T", "start_index": 1,
+                               "end_index": 1, "summary": "s", "nodes": []}]}
+    monkeypatch.setattr(page_index_module, "page_index_main", fake_main)
+    monkeypatch.setattr(pageindex.flash, "page_index_flash", fake_flash)
+    monkeypatch.setattr(pageindex.utils, "llm_completion",
+                        lambda model, prompt, **kw: "d.")
+    return runs
+
+
+def _scanned_pdf_file(tmp_path, name="scanned.pdf", pages=2):
+    from PIL import Image
+    frames = [Image.new("RGB", (300, 400), "white") for _ in range(pages)]
+    path = tmp_path / name
+    frames[0].save(path, "PDF", save_all=True, append_images=frames[1:])
+    return str(path)
+
+
+def _image_file(tmp_path, name, fmt, frames=1):
+    from PIL import Image
+    images = [Image.new("RGB", (200, 260), "white") for _ in range(frames)]
+    path = tmp_path / name
+    images[0].save(path, fmt, save_all=frames > 1, append_images=images[1:])
+    return str(path)
+
+
+def test_ocr_options_reach_the_local_indexer():
+    from pageindex import PageIndexLocalClient
+    api = PageIndexLocalClient()._api
+    assert (api._ocr, api._ocr_model) == ("auto", None)
+    api = PageIndexLocalClient(ocr="force", ocr_model="openai/gpt-4o")._api
+    assert (api._ocr, api._ocr_model) == ("force", "openai/gpt-4o")
+    api = PageIndexClient(index={"ocr": "off", "ocr_model": "m"})._api
+    assert (api._ocr, api._ocr_model) == ("off", "m")
+    with pytest.raises(PageIndexAPIError, match='ocr must be "off", "auto" or "force"'):
+        PageIndexLocalClient(ocr="always")
+    with pytest.raises(PageIndexAPIError, match=r'index\["ocr_model"\] must be a'):
+        PageIndexLocalClient(index={"ocr_model": 4})
+    with pytest.raises(PageIndexAPIError, match="index-side arguments"):
+        PageIndexClient(api_key="k", ocr="auto")
+
+
+def test_text_pdf_in_auto_keeps_flash_and_makes_no_vision_call(
+        local_client, sample_pdf, monkeypatch):
+    calls = _vision_mock(monkeypatch)
+    runs = _stub_pipelines(monkeypatch)
+    doc_id = local_client.submit_document(sample_pdf)["doc_id"]
+    assert calls == []
+    assert "flash" in runs and "standard" not in runs
+    assert local_client._api._store.get_meta(doc_id)["mode"] == "flash"
+
+
+def test_scanned_pdf_is_ocrd_and_indexed_by_the_standard_pipeline(tmp_path, monkeypatch):
+    from pageindex import PageIndexLocalClient
+    client = PageIndexLocalClient(storage_path=str(tmp_path / "store"),
+                                  index_model="openai/gpt-4o",
+                                  index_backend={"api_base": "http://idx.local"})
+    calls = _vision_mock(monkeypatch)
+    runs = _stub_pipelines(monkeypatch)
+    doc_id = client.submit_document(_scanned_pdf_file(tmp_path))["doc_id"]
+    assert [kind for _, kind, _ in calls] == ["transcribe", "transcribe"]
+    # OCR runs in the indexing lane: its model and its backend.
+    assert {model for model, _, _ in calls} == {"openai/gpt-4o"}
+    assert {backend["api_base"] for _, _, backend in calls} == {"http://idx.local"}
+    assert "flash" not in runs
+    assert [t for t, _ in runs["standard"]["page_list"]] == [
+        "Scanned words on the page"] * 2
+    pages = client.get_ocr(doc_id)["result"]
+    assert [p["markdown"] for p in pages] == ["Scanned words on the page"] * 2
+    assert client._api._store.get_meta(doc_id)["mode"] == "standard"
+
+
+def test_ocr_model_overrides_the_index_model(tmp_path, monkeypatch):
+    from pageindex import PageIndexLocalClient
+    client = PageIndexLocalClient(storage_path=str(tmp_path / "store"),
+                                  ocr_model="openai/vision-model")
+    calls = _vision_mock(monkeypatch)
+    _stub_pipelines(monkeypatch)
+    client.submit_document(_scanned_pdf_file(tmp_path, pages=1))
+    assert [model for model, _, _ in calls] == ["openai/vision-model"]
+
+
+def test_image_rich_page_stores_text_and_figure_description(
+        local_client, tmp_path, monkeypatch):
+    from conftest import build_pdf
+    calls = _vision_mock(monkeypatch, answer="A line chart of revenue")
+    runs = _stub_pipelines(monkeypatch)
+    path = tmp_path / "report.pdf"
+    path.write_bytes(build_pdf(["Quarterly revenue overview"],
+                               images={0: (72, 100, 468, 500)}))
+    doc_id = local_client.submit_document(str(path))["doc_id"]
+    assert [kind for _, kind, _ in calls] == ["describe"]
+    assert "flash" in runs  # the text layer is intact, flash still applies
+    stored = local_client.get_ocr(doc_id)["result"][0]["markdown"]
+    assert stored.startswith("Quarterly revenue overview")
+    assert "A line chart of revenue" in stored
+
+
+@pytest.mark.parametrize("name,fmt,frames", [
+    ("scan.png", "PNG", 1), ("photo.jpg", "JPEG", 1), ("photo.jpeg", "JPEG", 1),
+    # An animated PNG is read as its first frame only: one page, one call.
+    ("anim.png", "PNG", 3)])
+def test_image_files_are_indexed(local_client, tmp_path, monkeypatch, name, fmt, frames):
+    calls = _vision_mock(monkeypatch)
+    runs = _stub_pipelines(monkeypatch)
+    result = local_client.submit_document(_image_file(tmp_path, name, fmt, frames))
+    assert result["name"] == name
+    assert len(calls) == 1
+    assert "flash" not in runs
+    # The converted PDF is a temporary file, gone after the submit.
+    assert runs["standard"]["exists"]
+    assert not os.path.exists(runs["standard"]["doc"])
+    meta = local_client._api._store.get_meta(result["doc_id"])
+    assert meta["pageNum"] == 1 and meta["mode"] == "standard"
+
+
+@pytest.mark.parametrize("ext,fmt", [
+    ("webp", "WEBP"), ("tif", "TIFF"), ("tiff", "TIFF"), ("bmp", "BMP"),
+    ("gif", "GIF")])
+def test_images_other_than_png_and_jpeg_are_rejected(
+        local_client, tmp_path, monkeypatch, ext, fmt):
+    calls = _vision_mock(monkeypatch)
+    _stub_pipelines(monkeypatch)
+    with pytest.raises(PageIndexAPIError, match=r"only PDF files and PNG or JPEG"):
+        local_client.submit_document(_image_file(tmp_path, f"pic.{ext}", fmt))
+    # Their content behind a .png name is refused as well.
+    disguised = _image_file(tmp_path, f"pic-{ext}.png", fmt)
+    with pytest.raises(PageIndexAPIError, match="could not read image"):
+        local_client.submit_document(disguised)
+    assert calls == []
+    assert local_client.list_documents()["total"] == 0
+
+
+def test_taken_name_is_rejected_before_any_vision_call(local_client, tmp_path, monkeypatch):
+    calls = _vision_mock(monkeypatch)
+    runs = _stub_pipelines(monkeypatch)
+    taken = [{"name": "scanned.pdf"}] + [{"name": f"scanned_{n}.pdf"} for n in range(1, 100)]
+    monkeypatch.setattr(local_client._api._store, "list_metas", lambda: taken)
+    with pytest.raises(PageIndexAPIError, match="Too many files with similar names"):
+        local_client.submit_document(_scanned_pdf_file(tmp_path))
+    assert calls == [] and runs == {}
+
+
+def test_local_index_config_declares_every_local_index_key():
+    from pageindex import LocalIndexConfig
+    from pageindex.client import _LOCAL_INDEX_KEYS
+    assert set(_LOCAL_INDEX_KEYS) <= set(LocalIndexConfig.__annotations__)
+
+
+def test_disguised_image_is_rejected(local_client, tmp_path, monkeypatch):
+    calls = _vision_mock(monkeypatch)
+    _stub_pipelines(monkeypatch)
+    fake = tmp_path / "fake.png"
+    fake.write_bytes(b"definitely not an image")
+    with pytest.raises(PageIndexAPIError, match="could not read image"):
+        local_client.submit_document(str(fake))
+    assert calls == []
+
+
+def test_ocr_off_keeps_the_old_behaviour(tmp_path, monkeypatch):
+    from pageindex import PageIndexLocalClient
+    client = PageIndexLocalClient(storage_path=str(tmp_path / "store"), ocr="off")
+    calls = _vision_mock(monkeypatch)
+    _stub_pipelines(monkeypatch)
+    with pytest.raises(PageIndexAPIError, match="All pages are blank"):
+        client.submit_document(_scanned_pdf_file(tmp_path))
+    with pytest.raises(PageIndexAPIError, match="image files need OCR"):
+        client.submit_document(_image_file(tmp_path, "scan.png", "PNG"))
+    assert calls == []
+
+
+def test_blank_pdf_still_rejected_after_ocr(local_client, tmp_path, monkeypatch):
+    calls = _vision_mock(monkeypatch, answer="")
+    _stub_pipelines(monkeypatch)
+    with pytest.raises(PageIndexAPIError, match="All pages are blank"):
+        local_client.submit_document(_scanned_pdf_file(tmp_path))
+    assert len(calls) == 2
+
+
+def test_model_without_image_input_fails_once_with_a_clear_error(
+        local_client, tmp_path, monkeypatch):
+    import litellm
+
+    class BadRequest(Exception):
+        status_code = 400
+    attempts = []
+
+    async def reject(**kwargs):
+        attempts.append(kwargs["model"])
+        raise BadRequest("image input is not supported")
+    monkeypatch.setattr(litellm, "acompletion", reject)
+    _stub_pipelines(monkeypatch)
+    with pytest.raises(PageIndexAPIError, match="may not support image input"):
+        local_client.submit_document(_scanned_pdf_file(tmp_path, pages=1))
+    assert len(attempts) == 1

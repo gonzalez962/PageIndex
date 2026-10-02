@@ -1,15 +1,45 @@
 import argparse
 import os
 import json
+import tempfile
 from pageindex import *
+from pageindex.ocr import (DEFAULT_OCR_MODE, IMAGE_EXTENSIONS, OCR_MODES,
+                           has_image_extension, image_to_pdf, ocr_pages,
+                           page_needs_transcription)
 from pageindex.page_index_md import md_to_tree
 from pageindex.utils import ConfigLoader, SUMMARY_CONCURRENCY, SUMMARY_MAX_WORDS
 from pageindex.tree_optimize import EXPAND_CONCURRENCY
 
+IMAGE_TYPES = ', '.join(sorted(ext.lstrip('.') for ext in IMAGE_EXTENSIONS))
+
+
+def ocr_page_list(pdf_file, ocr_mode, ocr_model, flash, always=False):
+    """(text, tokens) pages after OCR, or None when the PDF text layer
+    serves as is (``always`` returns the pages regardless, for images). In flash mode only pages without a usable text layer
+    trigger OCR: flash reads the text layer itself, so figure descriptions
+    reach the tree in standard mode only."""
+    import PyPDF2
+    from pageindex.utils import count_tokens
+    try:
+        texts = [page.extract_text() or ''
+                 for page in PyPDF2.PdfReader(pdf_file).pages]
+    except Exception:
+        if flash:
+            return None  # flash validates the file and reports its own error
+        raise
+    if ocr_mode == 'off' or (flash and ocr_mode == 'auto' and
+                             not any(page_needs_transcription(t) for t in texts)):
+        return None
+    result = ocr_pages(pdf_file, texts, model=ocr_model, mode=ocr_mode)
+    if result.page_texts == texts and not always:
+        return None
+    return [(text, count_tokens(text, model=ocr_model)) for text in result.page_texts]
+
 if __name__ == "__main__":
     # Set up argument parser
     parser = argparse.ArgumentParser(description='Process PDF or Markdown document and generate structure')
-    parser.add_argument('--pdf_path', type=str, help='Path to the PDF file')
+    parser.add_argument('--pdf_path', type=str,
+                      help=f'Path to the PDF file, or a PNG/JPEG image ({IMAGE_TYPES}) indexed through OCR')
     parser.add_argument('--md_path', type=str, help='Path to the Markdown file')
     parser.add_argument('--mode', choices=['flash', 'standard'], default='flash',
                       help='Processing mode (default: flash)')
@@ -23,6 +53,15 @@ if __name__ == "__main__":
                       default=None,
                       help='Refine the tree for search cost (default: full in flash mode). '
                            '`merge` for deterministic merge only; `off` to disable')
+
+    parser.add_argument('--ocr', type=lambda value: value.strip().lower(),
+                      choices=list(OCR_MODES), default=None,
+                      help="OCR through the index model's vision input: auto transcribes pages "
+                           'without a text layer (and, in standard mode, describes figure-heavy '
+                           'pages), force transcribes every page, off reads the text layer only. '
+                           f"One vision call per OCR'd page (default: {DEFAULT_OCR_MODE})")
+    parser.add_argument('--ocr-model', type=str, default=None,
+                      help='Vision model used for OCR (default: the index model)')
 
     parser.add_argument('--index-model', type=str, default=None,
                       help='Model used to index the document (overrides config.yaml)')
@@ -67,6 +106,11 @@ if __name__ == "__main__":
         raise ValueError("Either --pdf_path or --md_path must be specified")
     if args.pdf_path and args.md_path:
         raise ValueError("Only one of --pdf_path or --md_path can be specified")
+    for flag, value in (('--ocr', args.ocr), ('--ocr-model', args.ocr_model)):
+        if value is not None and not args.pdf_path:
+            raise ValueError(f"{flag} requires --pdf_path")
+    if args.ocr is None:
+        args.ocr = DEFAULT_OCR_MODE
     for flag, value in (('--optimize', args.optimize),
                         ('--embedded-toc', args.embedded_toc),
                         ('--summary', args.summary),
@@ -88,12 +132,38 @@ if __name__ == "__main__":
                 raise ValueError(f"{flag} is not supported in flash mode; use --mode standard")
 
     if args.pdf_path:
-        # Validate PDF file
-        if not args.pdf_path.lower().endswith('.pdf'):
-            raise ValueError("PDF file must have .pdf extension")
+        # Validate the document: a PDF, or an image converted to one
+        is_image = has_image_extension(args.pdf_path)
+        if not (args.pdf_path.lower().endswith('.pdf') or is_image):
+            raise ValueError(f"Document must be a PDF (.pdf) or a PNG or JPEG image ({IMAGE_TYPES})")
         if not os.path.isfile(args.pdf_path):
-            raise ValueError(f"PDF file not found: {args.pdf_path}")
-            
+            raise ValueError(f"File not found: {args.pdf_path}")
+        if is_image and args.ocr == 'off':
+            raise ValueError("Image files need OCR; drop --ocr off")
+
+        index_model = ConfigLoader().load({k: v for k, v in {
+            'index_model': args.index_model,
+            'model': args.model,
+        }.items() if v is not None}).model
+        pdf_file = args.pdf_path
+        # A converted image is only read by OCR: an image always gets a
+        # page_list and so the standard pipeline, which reads that list (and
+        # never this scratch PDF). The directory goes away even when OCR fails.
+        with tempfile.TemporaryDirectory(prefix='pageindex-') as scratch:
+            if is_image:
+                pdf_file = os.path.join(scratch, 'document.pdf')
+                image_to_pdf(args.pdf_path, pdf_file)
+            page_list = ocr_page_list(pdf_file, args.ocr, args.ocr_model or index_model,
+                                      flash=args.mode == 'flash' and not is_image,
+                                      always=is_image)
+        if is_image:
+            pdf_file = args.pdf_path
+        if args.mode == 'flash' and page_list is not None:
+            # Flash reads the PDF text layer and cannot see OCR'd text.
+            print('Document needed OCR; indexing it in standard mode.')
+            args.mode = 'standard'
+            args.optimize = 'off'
+
         if args.mode == 'flash':
             from pageindex.flash import page_index_flash
             from pageindex.flash.api import flash_rejection_reason
@@ -104,7 +174,7 @@ if __name__ == "__main__":
             }.items() if v is not None}).summary_model
             will_summarize = args.summary if args.summary is not None else True
             toc_with_page_number = page_index_flash(
-                args.pdf_path,
+                pdf_file,
                 optimize=args.optimize if args.optimize != 'off' else False,
                 optimize_model=summary_model,
                 summary_model=summary_model,
@@ -138,7 +208,7 @@ if __name__ == "__main__":
                 'if_add_node_text': args.if_add_node_text,
             }
             opt = ConfigLoader().load({k: v for k, v in user_opt.items() if v is not None})
-            toc_with_page_number = page_index_main(args.pdf_path, opt)
+            toc_with_page_number = page_index_main(args.pdf_path, opt, page_list=page_list)
 
         print('Parsing done, saving to file...')
 

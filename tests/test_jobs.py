@@ -38,6 +38,17 @@ def test_create_moves_pdf_into_job_dir(store, tmp_path):
         assert json.load(handle) == job
 
 
+def test_create_records_the_original_upload_name(store, tmp_path):
+    job = store.create("0123abcd.png", _upload(tmp_path, "scan.png"),
+                       original_name="scan.png")
+    assert job["name"] == "0123abcd.png" and job["original_name"] == "scan.png"
+    assert store.get(job["id"]) == job
+    assert os.path.basename(store.pdf_path(job["id"])) == "0123abcd.png"
+    # Without one, the record has no original_name field at all.
+    plain = store.create("a.pdf", _upload(tmp_path))
+    assert "original_name" not in plain
+
+
 def test_update_is_atomic_and_leaves_no_temp_files(store, tmp_path):
     job = store.create("a.pdf", _upload(tmp_path))
     updated = store.update(job["id"], status="failed", error="nope")
@@ -395,3 +406,9 @@ def test_retry_refuses_running_queued_and_done_jobs(store, tmp_path):
     finally:
         client.release.set()
         runner.stop(timeout=1.0)
+
+
+def test_create_accepts_image_names(store, tmp_path):
+    job = store.create("scan.png", _upload(tmp_path, "scan.png"))
+    assert os.path.basename(store.pdf_path(job["id"])) == "scan.png"
+    assert job["name"] == "scan.png"

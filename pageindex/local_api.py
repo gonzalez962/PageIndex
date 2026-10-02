@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import os
 import re
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -42,7 +43,9 @@ class LocalAPI:
                  summary_max_words: int | None = None,
                  summary_concurrency: int | None = None,
                  use_embedded_toc: bool = True,
-                 optimize: str = "full"):
+                 optimize: str = "full",
+                 ocr: str = "auto",
+                 ocr_model: str | None = None):
         self._store = DocStore(storage_path)
         self._model = model
         self._summary_model = summary_model
@@ -51,6 +54,9 @@ class LocalAPI:
         self._summary_concurrency = summary_concurrency
         self._use_embedded_toc = use_embedded_toc
         self._optimize = optimize
+        from .ocr import validate_ocr_mode
+        self._ocr = validate_ocr_mode(ocr)
+        self._ocr_model = ocr_model
         from .utils import ConfigLoader
         self._config_loader = ConfigLoader()
 
@@ -116,39 +122,38 @@ class LocalAPI:
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"No such file: {file_path}")
         doc_name = sanitize_filename(os.path.basename(file_path))
-        if not doc_name.lower().endswith(".pdf"):
+        from .ocr import has_image_extension
+        is_image = has_image_extension(doc_name)
+        if not (doc_name.lower().endswith(".pdf") or is_image):
             raise PageIndexAPIError(
-                "Failed to submit document: only PDF files are supported in local mode."
+                "Failed to submit document: only PDF files and PNG or JPEG "
+                "images (png, jpg, jpeg) are supported in local mode."
+            )
+        if is_image and self._ocr == "off":
+            raise PageIndexAPIError(
+                "Failed to submit document: image files need OCR, which this "
+                "client disables (ocr='off'). Use ocr='auto' or 'force'."
             )
 
-        try:
-            page_texts = self._extract_page_texts(file_path)
-        except PageIndexAPIError:
-            raise
-        except Exception as e:
-            raise PageIndexAPIError(
-                f"Failed to submit document: could not read PDF: {e}"
-            ) from e
-        if not any(text.strip() for text in page_texts):
-            raise PageIndexAPIError(
-                "Failed to submit document: PDF has no content. All pages are blank."
-            )
+        # Fail a taken name before any vision call is paid for; the final
+        # check-then-write below still runs under the store lock.
         self._unique_doc_name(doc_name)
 
-        try:
-            if mode == "flash":
-                structure, description = run_off_loop(
-                    self._with_backend, self._index_flash, file_path
-                )
-            else:
-                structure, description = run_off_loop(
-                    self._with_backend, self._index_standard, file_path,
-                    page_texts
-                )
-        except PageIndexAPIError:
-            raise
-        except Exception as e:
-            raise PageIndexAPIError(f"Failed to submit document: {e}") from e
+        # A converted image lives only for this submit.
+        with tempfile.TemporaryDirectory(prefix="pageindex-") as scratch:
+            pdf_path = file_path
+            if is_image:
+                pdf_path = os.path.join(
+                    scratch, os.path.splitext(doc_name)[0] + ".pdf")
+                try:
+                    from .ocr import image_to_pdf
+                    image_to_pdf(file_path, pdf_path)
+                except Exception as e:
+                    raise PageIndexAPIError(
+                        f"Failed to submit document: could not read image: {e}"
+                    ) from e
+            structure, description, page_texts, mode = self._index_file(
+                pdf_path, doc_name, mode, needs_text_pipeline=is_image)
         self._check_page_bounds(structure, len(page_texts))
 
         doc_id = "pi-" + uuid.uuid4().hex
@@ -172,6 +177,55 @@ class LocalAPI:
             self._store.save_document(
                 doc_id, meta, remove_fields(structure, fields=["text"]), pages)
         return {"doc_id": doc_id, "name": meta["name"]}
+
+    def _index_file(self, pdf_path: str, doc_name: str, mode: str,
+                    needs_text_pipeline: bool) -> tuple[list, str | None, list[str], str]:
+        """Read, OCR and index one PDF. Returns the tree, description, the
+        final page texts and the pipeline that ran."""
+        try:
+            page_texts = self._extract_page_texts(pdf_path)
+        except PageIndexAPIError:
+            raise
+        except Exception as e:
+            raise PageIndexAPIError(
+                f"Failed to submit document: could not read PDF: {e}"
+            ) from e
+        if self._ocr != "off":
+            from .ocr import ocr_pages
+            try:
+                # Inside the indexing lane: its model and its credentials.
+                result = run_off_loop(
+                    self._with_backend, ocr_pages, pdf_path, page_texts,
+                    self._ocr_model or self._model, self._ocr)
+            except Exception as e:
+                raise PageIndexAPIError(
+                    f"Failed to submit document: OCR failed: {e}") from e
+            page_texts = [_scrub_surrogates(text) for text in result.page_texts]
+            # Flash reads the PDF text layer itself and cannot see what OCR
+            # transcribed; those documents take the standard pipeline.
+            needs_text_pipeline = needs_text_pipeline or result.needed_ocr
+        if not any(text.strip() for text in page_texts):
+            raise PageIndexAPIError(
+                "Failed to submit document: PDF has no content. All pages are blank."
+            )
+        if mode == "flash" and needs_text_pipeline:
+            logger.info("Document needed OCR; indexing it in standard mode.")
+            mode = "standard"
+        try:
+            if mode == "flash":
+                structure, description = run_off_loop(
+                    self._with_backend, self._index_flash, pdf_path
+                )
+            else:
+                structure, description = run_off_loop(
+                    self._with_backend, self._index_standard, pdf_path,
+                    page_texts
+                )
+        except PageIndexAPIError:
+            raise
+        except Exception as e:
+            raise PageIndexAPIError(f"Failed to submit document: {e}") from e
+        return structure, description, page_texts, mode
 
     def _unique_doc_name(self, name: str) -> str:
         """Mirror the cloud upload: a taken name gets _1.._99 appended,

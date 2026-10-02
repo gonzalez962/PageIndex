@@ -1239,7 +1239,10 @@ def page_index_main(doc, opt=None, logger=None, page_list=None):
          and sanitize_upload_filename(os.path.basename(doc)).lower().endswith(".pdf")) or
         isinstance(doc, BytesIO)
     )
-    if not is_valid_pdf:
+    # With page_list the pages are already read (OCR'd images included):
+    # doc only names the document.
+    named_pages = page_list is not None and isinstance(doc, str) and bool(doc)
+    if not (is_valid_pdf or named_pages):
         raise ValueError("Unsupported input type. Expected a PDF file path or BytesIO object.")
 
     if page_list is None:
