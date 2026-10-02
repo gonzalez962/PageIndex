@@ -994,6 +994,7 @@ def test_chat_unknown_doc_is_404(make):
     fake.chat_error = PageIndexAPIError("Documents not found or access denied: pi-x")
     api, _ = make(client=fake)
     assert api.post("/chat", json={"question": "q", "doc_id": "pi-x"}).status_code == 404
+    assert fake.chat_calls[0][2].get("stream") is True  # default request: streamed path
     assert api.post("/chat", json={"question": "q", "doc_id": "pi-x",
                                    "citations": False, "sources_read": False}).status_code == 404
 
@@ -1003,6 +1004,7 @@ def test_chat_upstream_failure_is_502_without_leaking(make):
     fake.chat_error = FakeUpstreamError("401 invalid api key sk-leaky")
     api, _ = make(client=fake)
     res = api.post("/chat", json={"question": "q"})
+    assert fake.chat_calls[0][2].get("stream") is True  # default request: streamed path
     assert res.status_code == 502
     assert "sk-leaky" not in res.text
     assert "FakeUpstreamError" in res.json()["detail"]
