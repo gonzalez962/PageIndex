@@ -48,6 +48,8 @@ from pageindex import PageIndexAPIError
 from pageindex.ocr import (IMAGE_EXTENSIONS, OCR_MODES, OCRModelError,
                            has_image_extension, sniff_image_format)
 from pageindex.text_document import read_text_document
+from server.chat_sources import (build_citations, build_sources_read,
+                                 collect_run, number_citations)
 from pageindex.utils import LLMRetriesExhausted
 from server.jobs import JobRunner, JobStore
 
@@ -244,10 +246,61 @@ def _job_error(exc: Exception) -> str:
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1)
     doc_id: Optional[Union[str, list[str]]] = None
+    citations: bool = False
+    sources_read: bool = False
+
+
+class CitationResponse(BaseModel):
+    index: int
+    document: Optional[str] = None
+    doc_id: Optional[str] = None
+    page: Optional[int] = None
+    section: Optional[str] = None
+
+
+class SourceReadResponse(BaseModel):
+    document: str
+    doc_id: Optional[str] = None
+    pages: list[int]
 
 
 class ChatResponse(BaseModel):
     answer: str
+    citations: Optional[list[CitationResponse]] = None
+    sources_read: Optional[list[SourceReadResponse]] = None
+
+
+def _raw_trees(client: Any, entries: list[dict]) -> dict[str, Any]:
+    """Stored trees (with page ranges) of the cited documents. A tree that
+    cannot be read only costs its citations their section title."""
+    trees: dict[str, Any] = {}
+    for entry in entries:
+        doc_id = entry.get("doc_id")
+        if doc_id and doc_id not in trees:
+            try:
+                # get_tree's wire shape drops start_index/end_index.
+                trees[doc_id] = client._api.raw_tree(doc_id)
+            except Exception:
+                trees[doc_id] = None
+    return trees
+
+
+def _doc_ids_by_name(client: Any) -> dict[str, str]:
+    """Document name -> id across the whole library; tool calls name
+    documents, and a name shared by several documents stays unresolved."""
+    ids: dict[str, list[str]] = {}
+    offset = 0
+    while True:
+        listing = client.list_documents(limit=10000, offset=offset)
+        documents = listing.get("documents", [])
+        for doc in documents:
+            name, doc_id = doc.get("name"), doc.get("id")
+            if name and doc_id:
+                ids.setdefault(name, []).append(doc_id)
+        offset += len(documents)
+        if not documents or offset >= listing.get("total", offset):
+            break
+    return {name: found[0] for name, found in ids.items() if len(found) == 1}
 
 
 # ---------- app ----------
@@ -507,13 +560,41 @@ def create_app(client: Any = None, env: Optional[Mapping[str, str]] = None,
         except Exception as exc:
             raise _http_error(exc) from exc
 
-    @app.post("/chat", response_model=ChatResponse, dependencies=protected)
+    @app.post("/chat", response_model=ChatResponse,
+              response_model_exclude_unset=True, dependencies=protected)
     def chat(body: ChatRequest) -> ChatResponse:
+        if not body.citations and not body.sources_read:
+            try:
+                client = get_client()
+                answer = client.chat(body.question, doc_id=body.doc_id)
+            except Exception as exc:
+                raise _http_error(exc) from exc
+            return ChatResponse(answer=answer)
+
+        # One streamed run gives the answer and the agent's tool calls.
+        stream = None
         try:
-            answer = get_client().chat(body.question, doc_id=body.doc_id)
+            client = get_client()
+            stream = client.chat(body.question, doc_id=body.doc_id,
+                                 citations=body.citations, stream=True,
+                                 show_process=False)
+            answer, tool_calls = collect_run(list(stream.events))
+            fields: dict[str, Any] = {}
+            if body.citations:
+                entries = client.get_citations(answer, doc_id=body.doc_id)
+                fields["citations"] = build_citations(
+                    entries, _raw_trees(client, entries))
+                answer = number_citations(answer)
+            if body.sources_read:
+                fields["sources_read"] = build_sources_read(
+                    tool_calls, _doc_ids_by_name(client))
+            # Only requested keys are set, so exclude_unset drops the rest.
+            return ChatResponse(answer=answer, **fields)
         except Exception as exc:
             raise _http_error(exc) from exc
-        return ChatResponse(answer=answer)
+        finally:
+            if stream is not None:
+                stream.close()
 
     return app
 
