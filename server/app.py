@@ -47,6 +47,7 @@ from starlette.concurrency import run_in_threadpool
 from pageindex import PageIndexAPIError
 from pageindex.ocr import (IMAGE_EXTENSIONS, OCR_MODES, OCRModelError,
                            has_image_extension, sniff_image_format)
+from pageindex.text_document import read_text_document
 from pageindex.utils import LLMRetriesExhausted
 from server.jobs import JobRunner, JobStore
 
@@ -251,32 +252,41 @@ class ChatResponse(BaseModel):
 
 # ---------- app ----------
 
-_UPLOAD_TYPES = ", ".join([".pdf", *sorted(IMAGE_EXTENSIONS)])
+_TEXT_EXTENSIONS = {".md", ".markdown", ".txt"}
+_UPLOAD_TYPES = ", ".join([".pdf", *sorted(IMAGE_EXTENSIONS),
+                            *sorted(_TEXT_EXTENSIONS)])
 
 
 def _safe_upload_name(filename: Optional[str]) -> str:
-    """The bare file name of a PDF, PNG or JPEG upload."""
+    """The bare file name of a supported document upload."""
     name = re.split(r"[\\/]", filename or "")[-1].strip()
     stem, ext = os.path.splitext(name)
-    if not stem or not (ext.lower() == ".pdf" or has_image_extension(name)):
+    if not stem or not (ext.lower() == ".pdf" or has_image_extension(name)
+                        or ext.lower() in _TEXT_EXTENSIONS):
         raise HTTPException(
-            415, f"Only PDF, PNG or JPEG uploads are supported ({_UPLOAD_TYPES}).")
+            415, f"Only PDF, PNG, JPEG, Markdown or text uploads are supported ({_UPLOAD_TYPES}).")
     return name
 
 
 def _stored_name(name: str) -> str:
-    """The on-disk name of an upload: PDFs keep theirs; images get a fresh
-    UUID name, so repeated uploads of one scan never collide as documents."""
+    """The on-disk name of an upload: documents keep theirs; images get a
+    fresh UUID name, so repeated scans never collide as documents."""
     ext = os.path.splitext(name)[1].lower()
-    if ext == ".pdf":
+    if ext == ".pdf" or ext in _TEXT_EXTENSIONS:
         return name
     return uuid.uuid4().hex + (".png" if ext == ".png" else ".jpg")
 
 
 def _check_upload_content(name: str, path: str) -> None:
-    """The bytes must match the declared kind: a PDF header, or an image
-    Pillow recognizes."""
-    if name.lower().endswith(".pdf"):
+    """The bytes must match the declared kind: PDF header, UTF-8 text, or an
+    image Pillow recognizes."""
+    ext = os.path.splitext(name)[1].lower()
+    if ext in _TEXT_EXTENSIONS:
+        try:
+            read_text_document(path)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    elif ext == ".pdf":
         with open(path, "rb") as check:
             if not check.read(5).startswith(b"%PDF-"):
                 raise HTTPException(400, "File is not a PDF.")

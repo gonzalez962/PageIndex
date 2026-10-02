@@ -349,10 +349,37 @@ def test_upload_returns_before_indexing_finishes(make):
         assert api.get("/health").json()["queue"] == {"queued": 0, "processing": 0}
 
 
+@pytest.mark.parametrize("name", ["notes.md", "notes.markdown", "notes.txt", "NOTES.MD"])
+def test_text_uploads_are_queued_and_indexed(make, name):
+    api, fake = make(env={"PAGEINDEX_OCR": "off"})
+    content = b"# Notes\n\nSome text."
+    with api:
+        res = api.post("/documents", files={"file": (name, content, "text/plain")})
+        assert res.status_code == 202
+        body = res.json()
+        job = wait_for_status(api, body["job_id"], "done")
+    assert body["name"] == job["name"] == name
+    assert "original_name" not in body
+    assert os.path.basename(fake.submitted[0][0]) == name
+    assert fake.submitted[0][1] == content
+
+
+@pytest.mark.parametrize("name,data", [
+    ("bad.txt", b"\xff"), ("nul.md", b"hello\x00world"), ("blank.markdown", b" \n\t")])
+def test_invalid_text_uploads_are_rejected(make, name, data):
+    api, fake = make()
+    res = api.post("/documents", files={"file": (name, data, "text/plain")})
+    assert res.status_code == 400
+    assert res.json()["detail"]
+    assert fake.submitted == []
+    assert api.get("/jobs").json()["total"] == 0
+
+
 def test_upload_rejects_non_pdf(make):
     api, fake = make()
-    res = api.post("/documents", files={"file": ("notes.txt", b"hi", "text/plain")})
+    res = api.post("/documents", files={"file": ("notes.docx", b"hi", "text/plain")})
     assert res.status_code == 415
+    assert "Markdown or text" in res.json()["detail"]
     assert fake.submitted == []
 
 
@@ -451,7 +478,7 @@ def test_oversized_upload_without_content_length_is_still_413(tmp_path):
 def test_rejected_uploads_create_no_job(make):
     api, _ = make()
     upload(api, "fake.pdf", b"not a pdf")
-    upload(api, "notes.txt", b"hi")
+    upload(api, "notes.docx", b"hi")
     assert api.get("/jobs").json()["total"] == 0
 
 
@@ -948,10 +975,10 @@ def test_upload_rejects_decompression_bombs_with_400(make, monkeypatch):
 
 def test_upload_rejects_unsupported_types(make):
     api, fake = make()
-    for name in ("notes.txt", "icon.ico", "scan.svg", ".png"):
+    for name in ("notes.docx", "icon.ico", "scan.svg", ".png"):
         res = upload(api, name, _png_bytes())
         assert res.status_code == 415
-        assert "PDF, PNG or JPEG" in res.json()["detail"]
+        assert "Markdown or text" in res.json()["detail"]
     assert fake.submitted == []
 
 
@@ -963,7 +990,7 @@ def test_upload_accepts_only_png_and_jpeg_images(make, ext, fmt):
     data = _png_bytes(fmt)
     res = upload(api, f"pic.{ext}", data)
     assert res.status_code == 415
-    assert "(.pdf, .jpeg, .jpg, .png)" in res.json()["detail"]
+    assert "(.pdf, .jpeg, .jpg, .png, .markdown, .md, .txt)" in res.json()["detail"]
     # Their content behind a .png name is not a supported image either.
     res = upload(api, "pic.png", data)
     assert res.status_code == 400
