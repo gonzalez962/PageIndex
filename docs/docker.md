@@ -52,11 +52,40 @@ when no token is configured. `/health` never needs it.
 curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"question": "What are the key findings?", "doc_id": "<doc_id>"}' \
   http://127.0.0.1:8000/chat
-# {"answer":"..."}
+# {"answer":"... [1]","citations":[...],"sources_read":[...]}
 ```
 
 `doc_id` accepts one id, a list of ids, or `null` (the whole library).
 Interactive docs are served at `http://127.0.0.1:8000/docs`.
+
+The `citations` and `sources_read` fields tell where the answer came from and
+are returned by default (both default to `true`). A plain request with
+`{"question": "...", "doc_id": "..."}` returns `answer`, `citations`, and
+`sources_read`. Send both flags as `false` to use the legacy response containing
+only `answer`; each flag can also be disabled independently:
+
+- `"citations": true` asks the model to cite each claim. The answer keeps
+  `[n]` markers and `citations` lists one entry per distinct source:
+  `document`, `doc_id`, `page`, and `section`, the title of the deepest tree
+  node covering that page (for Markdown, the heading of its section).
+  Citations are written by the model, so a claim can go uncited; `doc_id` is
+  `null` when the cited name matches no document, and `section` is `null`
+  when it cannot be found.
+- `"sources_read": true` lists the pages the agent actually read with
+  `get_page_content`, per document: `document`, `doc_id`, `pages`. Reading a
+  page does not mean the answer used it. `doc_id` is `null` when several
+  documents share the name.
+
+Both come from the same single chat run.
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"question": "What is the payment term?", "doc_id": "<doc_id>"}' \
+  http://127.0.0.1:8000/chat
+# {"answer":"The term is 30 days [1].",
+#  "citations":[{"index":1,"document":"notes.md","doc_id":"pi-...","page":3,"section":"Payment terms"}],
+#  "sources_read":[{"document":"notes.md","doc_id":"pi-...","pages":[2,3]}]}
+```
 
 ### Index a PDF
 
